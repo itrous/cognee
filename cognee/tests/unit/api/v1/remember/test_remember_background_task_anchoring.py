@@ -18,7 +18,13 @@ from uuid import uuid4
 
 import pytest
 
+from cognee.modules.pipelines.models.PipelineRunInfo import PipelineRunCompleted
+
 remember_module = importlib.import_module("cognee.api.v1.remember.remember")
+
+
+def _completed() -> PipelineRunCompleted:
+    return PipelineRunCompleted(pipeline_run_id=uuid4(), dataset_id=uuid4(), dataset_name="ds")
 
 
 @pytest.fixture(autouse=True)
@@ -31,16 +37,30 @@ def _no_db_setup(monkeypatch):
     monkeypatch.setattr("cognee.modules.engine.operations.setup.setup", _noop_setup)
 
 
+@pytest.fixture(autouse=True)
+def _no_job_store(monkeypatch, stub_document_preflight):
+    """A background document remember stores its job before starting; the
+    store is not under test here."""
+
+    async def _noop(*args, **kwargs):
+        return None
+
+    job_module = importlib.import_module("cognee.api.v1.remember.remember_job")
+    monkeypatch.setattr(job_module, "insert_running_job", _noop)
+    monkeypatch.setattr(job_module, "finish_job", _noop)
+
+
 @pytest.mark.asyncio
 async def test_background_remember_task_is_anchored_until_done(monkeypatch):
     release = asyncio.Event()
 
     async def fake_add(*args, **kwargs):
-        return None
+        return _completed()
 
     async def fake_cognify(*args, **kwargs):
         await release.wait()
-        return {}
+        run_info = _completed()
+        return {run_info.dataset_id: run_info}
 
     monkeypatch.setattr("cognee.api.v1.add.add", fake_add)
     monkeypatch.setattr("cognee.api.v1.cognify.cognify", fake_cognify)

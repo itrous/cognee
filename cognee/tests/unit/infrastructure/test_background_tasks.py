@@ -8,6 +8,7 @@ from uuid import uuid4
 import pytest
 
 from cognee.infrastructure import background_tasks
+from cognee.modules.pipelines.models.PipelineRunInfo import PipelineRunCompleted
 
 
 @pytest.fixture(autouse=True)
@@ -102,16 +103,42 @@ async def test_remember_registers_its_background_tasks(monkeypatch):
     async def _noop_setup():
         return None
 
+    def _completed():
+        return PipelineRunCompleted(pipeline_run_id=uuid4(), dataset_id=uuid4(), dataset_name="ds")
+
     async def fake_add(*args, **kwargs):
-        return None
+        return _completed()
 
     async def fake_cognify(*args, **kwargs):
         await release.wait()
-        return {}
+        run_info = _completed()
+        return {run_info.dataset_id: run_info}
+
+    # A background document remember resolves the dataset, checks name
+    # conflicts and stores its job before acknowledging; none is under test.
+    async def _resolve(dataset_name=None, dataset_id=None, user=None):
+        return user, SimpleNamespace(id=dataset_id or uuid4(), name=dataset_name or "ds")
+
+    async def _noop(*args, **kwargs):
+        return None
+
+    job_module = importlib.import_module("cognee.api.v1.remember.remember_job")
 
     monkeypatch.setattr("cognee.modules.engine.operations.setup.setup", _noop_setup)
     monkeypatch.setattr("cognee.api.v1.add.add", fake_add)
     monkeypatch.setattr("cognee.api.v1.cognify.cognify", fake_cognify)
+    monkeypatch.setattr(
+        "cognee.modules.pipelines.layers.resolve_authorized_user_dataset"
+        ".resolve_authorized_user_dataset",
+        _resolve,
+    )
+    monkeypatch.setattr(
+        "cognee.tasks.ingestion.refuse_changed_existing_documents"
+        ".refuse_changed_existing_documents",
+        _noop,
+    )
+    monkeypatch.setattr(job_module, "insert_running_job", _noop)
+    monkeypatch.setattr(job_module, "finish_job", _noop)
 
     result = await remember_module.remember(
         "note",

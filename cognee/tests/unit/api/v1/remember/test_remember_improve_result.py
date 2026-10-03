@@ -13,10 +13,15 @@ import pytest
 
 from cognee.modules.improve.config import ImproveConfig
 from cognee.modules.improve.result import ImproveResult, StageResult
+from cognee.modules.pipelines.models.PipelineRunInfo import PipelineRunCompleted
 
 remember_module = importlib.import_module("cognee.api.v1.remember.remember")
 debounce_module = importlib.import_module("cognee.api.v1.remember.auto_improve_debounce")
 improve_pkg = importlib.import_module("cognee.api.v1.improve")
+
+
+def _completed() -> PipelineRunCompleted:
+    return PipelineRunCompleted(pipeline_run_id=uuid4(), dataset_id=uuid4(), dataset_name="ds")
 
 
 @pytest.fixture(autouse=True)
@@ -30,16 +35,18 @@ def _no_db_setup(monkeypatch):
 
 
 @pytest.fixture
-def permanent_pipeline(monkeypatch):
+def permanent_pipeline(monkeypatch, stub_document_preflight):
     """Stub add()/cognify() so the permanent path runs without databases."""
     calls = {"add": 0, "cognify": 0}
 
     async def fake_add(*args, **kwargs):
         calls["add"] += 1
+        return _completed()
 
     async def fake_cognify(*args, **kwargs):
         calls["cognify"] += 1
-        return {}
+        run_info = _completed()
+        return {run_info.dataset_id: run_info}
 
     monkeypatch.setattr("cognee.api.v1.add.add", fake_add)
     monkeypatch.setattr("cognee.api.v1.cognify.cognify", fake_cognify)

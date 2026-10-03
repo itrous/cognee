@@ -10,6 +10,7 @@ import pytest
 # the `serve()` function re-exported in cognee/api/v1/__init__.py — mock's
 # pre-3.11 dotted-path walk hits the function and raises AttributeError.
 from cognee.api.v1.serve import state as serve_state
+from cognee.modules.pipelines.models.PipelineRunInfo import PipelineRunCompleted
 from cognee.modules.search.models.SearchResultPayload import SearchResultPayload
 from cognee.modules.search.types import SearchType
 
@@ -35,6 +36,9 @@ async def test_cognee_remember_public_api_completes():
     mock_user.id = uuid4()
     mock_dataset = MagicMock()
     mock_dataset.id = uuid4()
+    run_info = PipelineRunCompleted(
+        pipeline_run_id=uuid4(), dataset_id=mock_dataset.id, dataset_name="public_api"
+    )
 
     with (
         patch("cognee.shared.utils.send_telemetry"),
@@ -46,8 +50,11 @@ async def test_cognee_remember_public_api_completes():
             "resolve_authorized_user_datasets",
             AsyncMock(return_value=(mock_user, [mock_dataset])),
         ),
-        patch("cognee.api.v1.add.add", AsyncMock()) as add,
-        patch("cognee.api.v1.cognify.cognify", AsyncMock(return_value={})) as cognify,
+        patch("cognee.api.v1.add.add", AsyncMock(return_value=run_info)) as add,
+        patch(
+            "cognee.api.v1.cognify.cognify",
+            AsyncMock(return_value={run_info.dataset_id: run_info}),
+        ) as cognify,
     ):
         result = await cognee.remember(
             "public memory smoke",

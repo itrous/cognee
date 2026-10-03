@@ -9,6 +9,7 @@ import pytest
 
 from cognee.api.v1.session import SessionQAEntry
 from cognee.exceptions import CogneeValidationError
+from cognee.modules.pipelines.models.PipelineRunInfo import PipelineRunCompleted
 from cognee.modules.recall.types.RecallResponse import ResponseQAEntry
 from cognee.modules.search.models.SearchResultPayload import SearchResultPayload
 from cognee.modules.search.types import SearchType
@@ -40,6 +41,49 @@ def _get_remember_module():
     return importlib.import_module("cognee.api.v1.remember.remember")
 
 
+def _completed_run(dataset_name: str = "main_dataset") -> PipelineRunCompleted:
+    return PipelineRunCompleted(
+        pipeline_run_id=uuid4(), dataset_id=uuid4(), dataset_name=dataset_name
+    )
+
+
+def _completed_add(dataset_name: str = "main_dataset") -> AsyncMock:
+    """An add() mock that ends in a terminal successful run."""
+    return AsyncMock(return_value=_completed_run(dataset_name))
+
+
+def _completed_cognify(dataset_name: str = "main_dataset") -> AsyncMock:
+    """A cognify() mock that ends in a terminal successful run per dataset."""
+    run_info = _completed_run(dataset_name)
+    return AsyncMock(return_value={run_info.dataset_id: run_info})
+
+
+@contextmanager
+def _patch_background_document_preflight():
+    """Stub the dataset resolution, name-conflict check and job store a
+    background document remember runs before acknowledging."""
+
+    async def _resolve(dataset_name=None, dataset_id=None, user=None):
+        return user, MagicMock(id=dataset_id or uuid4(), name=dataset_name or "ds")
+
+    job_module = importlib.import_module("cognee.api.v1.remember.remember_job")
+    with (
+        patch(
+            "cognee.modules.pipelines.layers.resolve_authorized_user_dataset"
+            ".resolve_authorized_user_dataset",
+            new=_resolve,
+        ),
+        patch(
+            "cognee.tasks.ingestion.refuse_changed_existing_documents"
+            ".refuse_changed_existing_documents",
+            new=AsyncMock(return_value=None),
+        ),
+        patch.object(job_module, "insert_running_job", new=AsyncMock(return_value=None)),
+        patch.object(job_module, "finish_job", new=AsyncMock(return_value=None)),
+    ):
+        yield
+
+
 def _get_improve_module():
     return importlib.import_module("cognee.api.v1.improve")
 
@@ -66,8 +110,8 @@ async def test_remember_passes_session_ids_to_improve():
 
     with (
         _patch_remember_startup(),
-        patch("cognee.api.v1.add.add", AsyncMock()),
-        patch("cognee.api.v1.cognify.cognify", AsyncMock(return_value={"status": "ok"})),
+        patch("cognee.api.v1.add.add", _completed_add("test_ds")),
+        patch("cognee.api.v1.cognify.cognify", _completed_cognify("test_ds")),
         patch.object(_pkg_improve, "improve", mock_improve),
         patch(
             "cognee.modules.users.methods.get_default_user",
@@ -106,8 +150,8 @@ async def test_remember_no_session_ids_skips_in_improve():
 
     with (
         _patch_remember_startup(),
-        patch("cognee.api.v1.add.add", AsyncMock()),
-        patch("cognee.api.v1.cognify.cognify", AsyncMock(return_value={"status": "ok"})),
+        patch("cognee.api.v1.add.add", _completed_add()),
+        patch("cognee.api.v1.cognify.cognify", _completed_cognify()),
         patch.object(_pkg_improve, "improve", mock_improve),
         patch(
             "cognee.modules.users.methods.get_default_user",
@@ -293,11 +337,8 @@ class TestRememberResult:
 
         with (
             _patch_remember_startup(),
-            patch("cognee.api.v1.add.add", AsyncMock()),
-            patch(
-                "cognee.api.v1.cognify.cognify",
-                AsyncMock(return_value={}),
-            ),
+            patch("cognee.api.v1.add.add", _completed_add()),
+            patch("cognee.api.v1.cognify.cognify", _completed_cognify()),
             patch.object(_pkg_improve, "improve", AsyncMock()),
             patch(
                 "cognee.modules.users.methods.get_default_user",
@@ -405,8 +446,8 @@ class TestRememberResultSessions:
 
         with (
             _patch_remember_startup(),
-            patch("cognee.api.v1.add.add", AsyncMock()),
-            patch("cognee.api.v1.cognify.cognify", AsyncMock(return_value={})),
+            patch("cognee.api.v1.add.add", _completed_add()),
+            patch("cognee.api.v1.cognify.cognify", _completed_cognify()),
             patch.object(_pkg_improve, "improve", AsyncMock()),
             patch(
                 "cognee.modules.users.methods.get_default_user",
@@ -993,9 +1034,10 @@ class TestRecallResponseModelParam:
 async def test_self_improvement_opt_out_keeps_permanent_ingestion(flag, background):
     user = MagicMock()
     user.id = "u1"
-    add, cognify, improve = AsyncMock(), AsyncMock(return_value={"status": "ok"}), AsyncMock()
+    add, cognify, improve = _completed_add(), _completed_cognify(), AsyncMock()
     with (
         _patch_remember_startup(),
+        _patch_background_document_preflight(),
         patch("cognee.api.v1.add.add", add),
         patch("cognee.api.v1.cognify.cognify", cognify),
         patch.object(_pkg_improve, "improve", improve),

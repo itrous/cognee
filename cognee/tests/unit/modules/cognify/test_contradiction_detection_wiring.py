@@ -14,6 +14,7 @@ import os
 import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
+from uuid import uuid4
 
 import pytest
 from pydantic import ValidationError
@@ -26,6 +27,7 @@ from cognee.api.v1.remember.remember import remember
 # function, and pre-3.11 mock walks attributes instead of importing modules.
 from cognee.api.v1.serve import state as serve_state_module
 from cognee.modules.cognify.config import CognifyConfig
+from cognee.modules.pipelines.models.PipelineRunInfo import PipelineRunCompleted
 from cognee.tasks.graph.models import Contradiction, ContradictionList
 
 # `from cognee.api.v1.cognify import cognify` would resolve to the re-exported
@@ -123,6 +125,10 @@ class TestGetDefaultTasksSplice:
         assert "detect_contradictions" not in signature(get_default_tasks).parameters
 
 
+def _completed_run() -> PipelineRunCompleted:
+    return PipelineRunCompleted(pipeline_run_id=uuid4(), dataset_id=uuid4(), dataset_name="ds")
+
+
 class TestRememberInheritsTheFlag:
     """remember() builds its graph through cognify(), so the flag reaches it too.
 
@@ -147,7 +153,8 @@ class TestRememberInheritsTheFlag:
                     else tasks_arg
                 )
                 captured["tasks"] = [task.executable.__name__ for task in resolved]
-                return {}
+                run_info = _completed_run()
+                return {run_info.dataset_id: run_info}
 
             return _run
 
@@ -159,7 +166,7 @@ class TestRememberInheritsTheFlag:
             patch.object(_mod_migrations_startup, "run_migrations_and_block", new=AsyncMock()),
             patch.object(_mod_serve_state, "get_remote_client", return_value=None),
             patch.object(_mod_engine_setup, "setup", new=AsyncMock()),
-            patch.object(_pkg_add, "add", new=AsyncMock()),
+            patch.object(_pkg_add, "add", new=AsyncMock(return_value=_completed_run())),
             patch.object(
                 _mod_users_methods,
                 "get_default_user",
