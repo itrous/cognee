@@ -20,7 +20,7 @@ They double as the smoke-test corpus the team uses to verify behaviour across th
 
 | Folder | What lives there | Count |
 |---|---|---|
-| [`guides/`](guides/) | One feature per script: concise, self-contained how-tos | 38 |
+| [`guides/`](guides/) | One feature per script: concise, self-contained how-tos | 39 |
 | [`advanced_guides/`](advanced_guides/) | Deeper takes on topics a guide already covers | 8 |
 | [`demos/`](demos/) | Multiple features stitched into use cases, grouped by topic | 28 |
 | [`integrations/`](integrations/) | Connector packages and deployment kits that pair cognee with other systems | 1 |
@@ -83,6 +83,7 @@ features.** See [Contributing](#-contributing-a-new-example) for the precise cat
 | [`gmail.py`](guides/gmail.py) | Ingest Gmail with the bundled SDK connector, incremental sync and delete propagation (needs `cognee[gmail]`) |
 | [`google_drive.py`](guides/google_drive.py) | Ingest a Drive folder with the bundled SDK connector (needs `cognee[google-drive]`) |
 | [`presort_downloads.py`](guides/presort_downloads.py) | Presorting a messy folder before ingestion: `remember(dry_run="presort")`, then ingest the report |
+| [`remember_job_status.py`](guides/remember_job_status.py) | Background `POST /api/v1/remember` → 202 + `job_id`, then polling `GET /api/v1/remember/jobs/{job_id}` for `completed` / `errored` (needs a running API) |
 
 ### Visualization
 | Script | Demonstrates |

@@ -204,9 +204,10 @@ def get_remember_router() -> APIRouter:
         run_in_background: bool | None = Form(
             default=False,
             description=(
-                "If true, the request returns immediately (status 'running' with a "
-                "pipeline_run_id) while ingestion and graph building continue server-side — "
-                "poll GET /v1/datasets/status to track completion. If false, the request "
+                "If true, the request returns immediately (status 'running') while ingestion "
+                "and graph building continue server-side. For normal ingestion the answer is "
+                "202 with a job_id — poll GET /v1/remember/jobs/{job_id} for the outcome of "
+                "this write (completed or errored). If false, the request "
                 "blocks until the knowledge graph is fully built, which can take minutes "
                 "for large files."
             ),
@@ -335,6 +336,10 @@ def get_remember_router() -> APIRouter:
           data is ingested directly via add + cognify.
         - **node_set** (Optional[List[str]]): Node identifiers for graph organisation.
         - **run_in_background** (Optional[bool]): Run the cognify step asynchronously (default: False).
+          For normal ingestion (no session_id, no content_type) the request is answered
+          with **202** and a ``job_id`` once the input, permissions and name conflicts are
+          checked and the job is stored; ``GET /v1/remember/jobs/{job_id}`` then reports
+          ``running`` → ``completed`` or ``errored`` for this write.
         - **self_improvement** (Optional[bool]): Run the improve loop after cognify
           (default: True). False gives a plain add + cognify ingestion.
         - **custom_prompt** (Optional[str]): Custom prompt for entity extraction.
@@ -368,7 +373,8 @@ def get_remember_router() -> APIRouter:
           combination (no raw_data repository specs, file uploads or session_id with
           content_type="code", index_vectors without it, or local repo paths while
           ACCEPT_LOCAL_FILE_PATH=false)
-        - **409 Conflict**: Error during processing
+        - **409 Conflict**: Error during processing, or an upload whose name the dataset
+          already holds with other content
         """
         # Swagger UI submits an untouched file list as one blank part; treat it
         # as "no uploads" (and reject its "string" placeholder with a clear 400).
@@ -621,6 +627,15 @@ def get_remember_router() -> APIRouter:
                 raise_on_error=False,
             )
 
+            # A background document remember with a durable job: accepted, not
+            # done. Its outcome is read via GET /v1/remember/jobs/{job_id}.
+            if getattr(result, "job_id", None):
+                accepted = result.to_dict()
+                accepted["status"] = "running"
+                for key in ("error", "error_class", "error_http_status"):
+                    accepted.pop(key, None)
+                return JSONResponse(status_code=202, content=jsonable_encoder(accepted))
+
             # A blocking run that ended errored must not look like a success
             # to status-code-checking clients.
             if result.status == "errored":
@@ -646,6 +661,60 @@ def get_remember_router() -> APIRouter:
                 status_code=409,
                 content={"error": f"An error occurred during remember: {error}"},
             )
+
+    @router.get(
+        "/capabilities",
+        summary="Remember features this server supports",
+        response_model=dict,
+    )
+    async def remember_capabilities(user: User = Depends(get_authenticated_user)):
+        """
+        Report the optional remember contracts this server implements.
+
+        ``document_job_status_version`` is the version of the background job
+        contract for normal (add + cognify) remember: a background request is
+        answered with 202 and a ``job_id``, readable via
+        ``GET /v1/remember/jobs/{job_id}``. Session, skills, code and archive
+        remembers are not covered by it.
+        """
+        from cognee.api.v1.remember.remember_job import REMEMBER_JOB_VERSION
+
+        return {"document_job_status_version": REMEMBER_JOB_VERSION}
+
+    @router.get(
+        "/jobs/{job_id}",
+        summary="Status of one background document remember",
+        response_model=dict,
+    )
+    async def get_remember_job(job_id: str, user: User = Depends(get_authenticated_user)):
+        """
+        Read the stored status of a background document remember.
+
+        ## Response
+        ``job_id``, ``status`` (``running`` / ``completed`` / ``errored``),
+        ``dataset_name``, ``dataset_id``, ``pipeline_run_id`` (the cognify run,
+        may be null), ``items_processed`` and ``elapsed_seconds``, plus
+        ``items`` / ``content_hash`` / ``improve`` / ``improve_error`` when
+        present. An ``errored`` job carries ``error``, ``error_class`` and
+        ``error_http_status`` (the status of the failure, not of this request):
+        a failed write is answered with 200 here, so check ``status``.
+        ``running`` means no terminal result is stored yet, not that a
+        process is proven to be working on it.
+
+        ## Error Codes
+        - **404 Not Found**: No such job for this user (unknown id, another
+          user's or tenant's job, or a remember recorded without a job)
+        """
+        from cognee.api.v1.remember.remember_job import get_job_snapshot
+
+        try:
+            parsed_job_id = UUID(job_id)
+        except ValueError:
+            parsed_job_id = None
+        snapshot = await get_job_snapshot(parsed_job_id, user) if parsed_job_id else None
+        if snapshot is None:
+            raise HTTPException(status_code=404, detail="Remember job not found.")
+        return jsonable_encoder(snapshot)
 
     class RememberEntryRequest(BaseModel):
         """JSON body for the typed-entry remember endpoint.

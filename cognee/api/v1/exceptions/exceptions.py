@@ -1,6 +1,6 @@
 from fastapi import status
 
-from cognee.exceptions import CogneeConfigurationError, CogneeValidationError
+from cognee.exceptions import CogneeConfigurationError, CogneeSystemError, CogneeValidationError
 
 
 class InvalidConfigAttributeError(CogneeConfigurationError):
@@ -128,3 +128,28 @@ class DocumentSubgraphNotFoundError(CogneeValidationError):
         status_code: int = status.HTTP_404_NOT_FOUND,
     ):
         super().__init__(message, name, status_code)
+
+
+class RememberStageFailedError(CogneeSystemError):
+    """A stage of a document remember (add or cognify) did not finish successfully.
+
+    Raised by a blocking ``remember(..., raise_on_error=True)`` when a stage
+    *returned* a failure instead of raising one: an errored or non-terminal
+    pipeline run info, or an errored data item. ``stage``, ``error_class`` and
+    ``error_message`` (PII-scrubbed) say which stage failed and why.
+    """
+
+    def __init__(
+        self,
+        stage: str,
+        error_class: str,
+        error_message: str,
+        name: str = "RememberStageFailedError",
+        # The same failure is a 409 on a non-raising remember (HTTP errored body
+        # and a job's error_http_status), so the raised form answers 409 too.
+        status_code: int = status.HTTP_409_CONFLICT,
+    ):
+        self.stage = stage
+        self.error_class = error_class
+        self.error_message = error_message
+        super().__init__(f"remember {stage} failed: {error_message}", name, status_code)

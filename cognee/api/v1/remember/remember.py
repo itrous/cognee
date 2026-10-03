@@ -625,6 +625,13 @@ class RememberResult:
         improve_error: Why the automatic improve failed, when it did. The
             remember itself succeeded in that case: ``status`` stays
             ``"completed"`` / ``"session_stored"`` and only this field is set.
+        job_id: Id of the durable job of a background document remember
+            (add + cognify): its status is readable after the call returns via
+            ``GET /api/v1/remember/jobs/{job_id}``. ``None`` for blocking,
+            session and special-content remembers.
+        error_class / error_http_status: Why an errored remember failed —
+            the failure's class name and the HTTP status a blocking request
+            would have answered with.
 
     Example::
 
@@ -673,6 +680,11 @@ class RememberResult:
         # (A5). An improve failure never flips `status`; it lands here.
         self.improve: ImproveResult | None = None
         self.improve_error: str | None = None
+        self.job_id: str | None = None
+        self.error_class: str | None = None
+        self.error_http_status: int | None = None
+        # PII-scrubbed failure text for network/durable surfaces (job status).
+        self._safe_error: str | None = None
         self._task: asyncio.Task | None = None
         self._started_at: float = time.monotonic()
 
@@ -738,6 +750,12 @@ class RememberResult:
             d["improve"] = dump(mode="json") if callable(dump) else self.improve
         if self.improve_error:
             d["improve_error"] = self.improve_error
+        if self.job_id:
+            d["job_id"] = self.job_id
+        if self.error_class:
+            d["error_class"] = self.error_class
+        if self.error_http_status:
+            d["error_http_status"] = self.error_http_status
         return d
 
     def _attach_improve_payload(self, payload: dict) -> None:
@@ -859,9 +877,95 @@ class RememberResult:
 
     def _fail(self, exc: BaseException):
         """Mark the result as failed with an error message and elapsed time."""
+        from cognee.exceptions import CogneeApiError
+        from cognee.modules.operations import scrub_error_message
+
         self.status = "errored"
-        self.error = str(exc)
         self.elapsed_seconds = time.monotonic() - self._started_at
+        self.error_class = type(exc).__name__
+        if isinstance(exc, asyncio.CancelledError):
+            self.error = "remember was cancelled before it finished"
+            self._safe_error = self.error
+            self.error_http_status = 503
+            return
+        self.error = str(exc) or type(exc).__name__
+        self._safe_error = scrub_error_message(exc) or type(exc).__name__
+        status_code = getattr(exc, "status_code", None) if isinstance(exc, CogneeApiError) else None
+        # The status a blocking HTTP remember answers this failure with: a
+        # cognee error carries its own, everything else is the generic 409.
+        self.error_http_status = (
+            status_code if isinstance(status_code, int) and 400 <= status_code <= 599 else 409
+        )
+
+    def _fail_stage(self, failure: "_StageFailure"):
+        """Mark the result as failed by a stage that *returned* a failure."""
+        self.status = "errored"
+        self.elapsed_seconds = time.monotonic() - self._started_at
+        self.error = failure.message
+        self._safe_error = failure.message
+        self.error_class = failure.error_class
+        # A blocking HTTP remember answers an errored run with 409.
+        self.error_http_status = 409
+
+
+_TERMINAL_SUCCESS_STATUSES = ("PipelineRunCompleted", "PipelineRunAlreadyCompleted")
+
+
+class _StageFailure:
+    """Why a remember stage (add / cognify) did not finish successfully."""
+
+    def __init__(self, stage: str, error_class: str, detail: str):
+        from cognee.modules.operations import scrub_error_message
+
+        self.stage = stage
+        self.error_class = error_class
+        self.detail = scrub_error_message(detail) or error_class
+        self.message = f"{stage}: {self.detail}"
+
+    def to_exception(self):
+        from cognee.api.v1.exceptions import RememberStageFailedError
+
+        return RememberStageFailedError(self.stage, self.error_class, self.detail)
+
+
+def _stage_failure(stage: str, stage_result) -> "_StageFailure | None":
+    """Classify what add() / cognify() returned; None only for a terminal success.
+
+    A stage succeeded only when every run info it returned is terminal and
+    successful (``PipelineRunCompleted`` / ``PipelineRunAlreadyCompleted``)
+    and no data item in it errored. Anything else — an errored run, a
+    non-terminal or unrecognized result, an empty result — is a failure: the
+    absence of an exception is not proof the write happened.
+    """
+    if isinstance(stage_result, dict):
+        run_infos = list(stage_result.values())
+    elif stage_result is not None and hasattr(stage_result, "status"):
+        run_infos = [stage_result]
+    else:
+        run_infos = []
+
+    if not run_infos:
+        return _StageFailure(stage, "RememberStageNoResult", "the stage returned no run result")
+
+    for run_info in run_infos:
+        status = str(getattr(run_info, "status", "") or "")
+        if "Errored" in status:
+            error_class = getattr(run_info, "error_class", None) or "PipelineRunErrored"
+            detail = getattr(run_info, "error_message", None) or f"{stage} pipeline run errored"
+            return _StageFailure(stage, error_class, detail)
+        if status not in _TERMINAL_SUCCESS_STATUSES:
+            return _StageFailure(
+                stage,
+                "RememberStageNotTerminal",
+                f"the stage ended without a terminal result ({status or type(run_info).__name__})",
+            )
+        for entry in getattr(run_info, "data_ingestion_info", None) or []:
+            item_info = entry.get("run_info") if isinstance(entry, dict) else None
+            if "Errored" in str(getattr(item_info, "status", "") or ""):
+                error_class = getattr(item_info, "error_class", None) or "PipelineRunErrored"
+                detail = getattr(item_info, "error_message", None) or "a data item errored"
+                return _StageFailure(stage, error_class, detail)
+    return None
 
 
 async def remember(
@@ -1920,14 +2024,33 @@ async def _remember_inner(
         )
 
         # Permanent memory: add + cognify (+ optional improve)
+        from cognee.modules.pipelines.models import OperationOutcome
+
+        def _stage_failed(failure: "_StageFailure | None") -> bool:
+            """Record a returned stage failure; stop the chain (raise when blocking-loud)."""
+            if failure is None:
+                return False
+            result._fail_stage(failure)
+            # The operation record must not read "succeeded" for a write whose
+            # stage returned a failure (a raise is recorded as failed anyway).
+            operation_context.set_outcome(OperationOutcome.FAILED)
+            logger.warning("remember: %s", failure.message)
+            if raise_on_error and not run_in_background:
+                raise failure.to_exception()
+            return True
+
         async def _run():
-            await add(
+            add_result = await add(
                 data=data,
                 dataset_name=dataset_name,
                 dataset_id=dataset_id,
                 **shared_kwargs,
                 **add_kwargs,
             )
+            # add() reports a failed item as a returned errored run info, not
+            # an exception: cognify must not run (and succeed) over it.
+            if _stage_failed(_stage_failure("add", add_result)):
+                return
 
             datasets_arg = [dataset_name] if dataset_id is None else [dataset_id]
 
@@ -1950,6 +2073,8 @@ async def _remember_inner(
             )
 
             result._resolve(cognify_result)
+            if _stage_failed(_stage_failure("cognify", cognify_result)):
+                return
 
             if auto_improve:
                 from cognee.api.v1.improve import improve
@@ -1988,12 +2113,52 @@ async def _remember_inner(
 
             data = await materialize_stream_for_background(data)
 
+            # Refuse what is known to fail before acknowledging anything: the
+            # dataset is resolved with a write check, and a changed document
+            # under an existing name is a 409 now instead of a background
+            # failure. add() repeats the check, so a late conflict still
+            # lands on the job.
+            from cognee.api.v1.remember.remember_job import finish_job, insert_running_job
+            from cognee.modules.pipelines.layers.resolve_authorized_user_dataset import (
+                resolve_authorized_user_dataset,
+            )
+            from cognee.tasks.ingestion.refuse_changed_existing_documents import (
+                refuse_changed_existing_documents,
+            )
+
+            user, authorized_dataset = await resolve_authorized_user_dataset(
+                dataset_name=dataset_name, dataset_id=dataset_id, user=user
+            )
+            shared_kwargs["user"] = user
+            operation_context.set_user(user)
+            operation_context.set_dataset(authorized_dataset.id)
+            result.dataset_id = str(authorized_dataset.id)
+            result.dataset_name = authorized_dataset.name
+            await refuse_changed_existing_documents(data, user, authorized_dataset)
+
+            # The job row is committed before the task exists: a failed write
+            # raises here and nothing is started. The row is this operation's
+            # record, so the recorder must not write its own on scope exit.
+            await insert_running_job(operation_context, result)
+            operation_context.defer_close()
+            result.job_id = str(operation_context.operation_id)
+
             async def _remember_background():
+                cancelled: asyncio.CancelledError | None = None
                 try:
                     await _run()
+                except asyncio.CancelledError as exc:
+                    result._fail(exc)
+                    cancelled = exc
+                    logger.warning("Background remember was cancelled")
                 except Exception as exc:
                     result._fail(exc)
                     logger.exception("Background remember failed")
+                # The snapshot is taken only now, after add, cognify and the
+                # optional improve have all finished.
+                await finish_job(operation_context, result)
+                if cancelled is not None:
+                    raise cancelled
 
             result._task = _anchor_background_task(asyncio.create_task(_remember_background()))
             return result
