@@ -177,7 +177,7 @@ class OpenAICompatibleEmbeddingEngine(EmbeddingEngine):
                     self._client.embeddings.create(**create_kwargs),
                     timeout=300.0,
                 )
-            embeddings = [item.embedding for item in response.data]
+            embeddings = [self._fit_to_dimensions(item.embedding) for item in response.data]
 
         except Exception as error:
             # A proxy spend cap is terminal, and none of the branches below can
@@ -273,6 +273,25 @@ class OpenAICompatibleEmbeddingEngine(EmbeddingEngine):
             ) from error
 
         return handle_embedding_response(original_texts, embeddings, self.dimensions)
+
+    def _fit_to_dimensions(self, vector: list[float]) -> list[float]:
+        """Cut a wider vector down to ``dimensions`` and renormalise (Matryoshka models only).
+
+        Opt-in via ``EMBEDDING_TRUNCATE_TO_DIMENSIONS``: the first N coordinates of a Matryoshka
+        embedding (Qwen3-Embedding, OpenAI text-embedding-3, ...) are an embedding in their own
+        right, which lets a store keep narrower, indexable vectors. For any other model the cut
+        vector is meaningless, so without the flag a width mismatch stays an error at insert time.
+        """
+        if (
+            not self.dimensions
+            or len(vector) <= self.dimensions
+            or os.getenv("EMBEDDING_TRUNCATE_TO_DIMENSIONS", "").strip().lower()
+            not in ("1", "true", "yes", "on")
+        ):
+            return vector
+        head = np.asarray(vector[: self.dimensions], dtype=np.float64)
+        norm = float(np.linalg.norm(head))
+        return (head / norm if norm else head).tolist()
 
     def get_vector_size(self) -> int:
         """

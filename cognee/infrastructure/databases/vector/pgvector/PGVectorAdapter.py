@@ -1,4 +1,5 @@
 import asyncio
+import os
 import re
 from typing import Any, get_type_hints
 from uuid import UUID
@@ -32,6 +33,21 @@ from .serialize_data import serialize_data
 
 logger = get_logger("PGVectorAdapter")
 QUERY_BATCH_SIZE = 1000
+
+# pgvector indexes a ``vector`` column up to 2000 dimensions and a ``halfvec`` column up to 4000,
+# so a wide embedder (4096) has no ANN index: every search scans the whole table. Two opt-in
+# switches (both off by default, so existing stores are untouched) let a deployment store
+# narrower half-precision vectors and keep an HNSW index on them:
+#   PGVECTOR_HALFVEC=true       new collections get a ``halfvec(N)`` column instead of ``vector(N)``
+#   PGVECTOR_HNSW_INDEX=true    new collections get an HNSW cosine index on that column
+# Existing tables are converted by hand; the adapter only follows the flag for what it creates
+# and inserts, so the flag must match the stored column type.
+HNSW_INDEX_MAX_LIMIT = 1000
+HNSW_MIN_EF_SEARCH = 100
+
+
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in ("1", "true", "yes", "on")
 
 # Default pool sizing for per-dataset PGVector engines when ENABLE_BACKEND_ACCESS_CONTROL=True.
 # Lean pool_size limits connection fan-out across datasets (only pool_size connections are
@@ -179,6 +195,24 @@ class PGVectorAdapter(SQLAlchemyAdapter, VectorDBInterface):
 
         self.Vector = Vector
 
+    def _vector_column_type(self, vector_size: int):
+        """Column type for new collections and inserts: ``halfvec(N)`` under PGVECTOR_HALFVEC."""
+        if _env_flag("PGVECTOR_HALFVEC"):
+            from pgvector.sqlalchemy import HALFVEC
+
+            return HALFVEC(vector_size)
+        return self.Vector(vector_size)
+
+    def _hnsw_index_ddl(self, collection_name: str) -> str:
+        """``CREATE INDEX`` for the collection's vector column, cosine like every search here."""
+        opclass = "halfvec_cosine_ops" if _env_flag("PGVECTOR_HALFVEC") else "vector_cosine_ops"
+        quote = self.engine.dialect.identifier_preparer.quote
+        index_name = f"ix_{collection_name}_vector_hnsw"[:63]
+        return (
+            f"CREATE INDEX IF NOT EXISTS {quote(index_name)} "
+            f"ON {quote(collection_name)} USING hnsw (vector {opclass})"
+        )
+
     def reset_metadata_cache(self):
         """
         Reset SQLAlchemy metadata reflection cache for this adapter instance.
@@ -286,7 +320,7 @@ class PGVectorAdapter(SQLAlchemyAdapter, VectorDBInterface):
 
         widths = []
         for declared_type in declared_types:
-            match = re.fullmatch(r"vector\((\d+)\)", declared_type or "")
+            match = re.fullmatch(r"(?:vector|halfvec)\((\d+)\)", declared_type or "")
             if match:
                 widths.append(int(match.group(1)))
         return choose_stored_vector_size(widths, self.name)
@@ -352,7 +386,7 @@ class PGVectorAdapter(SQLAlchemyAdapter, VectorDBInterface):
                         # PGVector requires one column to be the primary key
                         id: Mapped[data_point_types["id"]] = mapped_column(primary_key=True)
                         payload = Column(JSON)
-                        vector = Column(self.Vector(vector_size))
+                        vector = Column(self._vector_column_type(vector_size))
 
                         def __init__(self, id, payload, vector):
                             """Initialize the pgvector row with id, JSON payload, and vector."""
@@ -365,6 +399,8 @@ class PGVectorAdapter(SQLAlchemyAdapter, VectorDBInterface):
                             await connection.run_sync(
                                 Base.metadata.create_all, tables=[PGVectorDataPoint.__table__]
                             )
+                        if _env_flag("PGVECTOR_HNSW_INDEX"):
+                            await connection.exec_driver_sql(self._hnsw_index_ddl(collection_name))
                     # Reflect AFTER the DDL transaction commits so
                     # _metadata is never populated for a table that
                     # might be rolled back.
@@ -407,7 +443,7 @@ class PGVectorAdapter(SQLAlchemyAdapter, VectorDBInterface):
             # PGVector requires one column to be the primary key
             id: Mapped[data_point_types["id"]] = mapped_column(primary_key=True)
             payload = Column(JSON)
-            vector = Column(self.Vector(vector_size))
+            vector = Column(self._vector_column_type(vector_size))
 
             def __init__(self, id, payload, vector):
                 self.id = id
@@ -710,6 +746,9 @@ class PGVectorAdapter(SQLAlchemyAdapter, VectorDBInterface):
             if limit > 0:
                 query = query.limit(limit)
 
+            if _env_flag("PGVECTOR_HNSW_INDEX"):
+                await self._tune_index_scan(session, limit)
+
             # Find closest vectors to query_vector
             closest_items = await session.execute(query)
 
@@ -741,6 +780,23 @@ class PGVectorAdapter(SQLAlchemyAdapter, VectorDBInterface):
             )
             for row in vector_list
         ]
+
+    async def _tune_index_scan(self, session, limit: int) -> None:
+        """Make an HNSW scan answer like the exact scan it replaces.
+
+        A bounded top-k uses the index with ``ef_search`` at least as wide as k, and strict
+        iterative scan so a ``belongs_to_set`` filter keeps scanning until k rows survive it
+        (a plain scan returns fewer). An unbounded or very large k (the callers that pass
+        ``limit=None`` want every row ranked) must not use the index at all: a graph scan stops
+        after ``ef_search`` candidates and would silently truncate the result.
+        """
+        if limit > HNSW_INDEX_MAX_LIMIT:
+            await session.execute(text("SET LOCAL enable_indexscan = off"))
+            return
+        await session.execute(
+            text(f"SET LOCAL hnsw.ef_search = {max(HNSW_MIN_EF_SEARCH, int(limit))}")
+        )
+        await session.execute(text("SET LOCAL hnsw.iterative_scan = strict_order"))
 
     async def batch_search(
         self,
