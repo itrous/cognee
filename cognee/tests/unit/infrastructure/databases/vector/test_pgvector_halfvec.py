@@ -133,3 +133,21 @@ def test_vector_of_the_configured_width_is_untouched(monkeypatch):
     monkeypatch.setenv("EMBEDDING_TRUNCATE_TO_DIMENSIONS", "true")
     vector = [3.0, 4.0]
     assert _engine(2)._fit_to_dimensions(vector) == vector
+
+
+def _index_name(ddl):
+    return ddl.split("EXISTS ")[1].split(" ON")[0].strip('"')
+
+
+@pytest.mark.parametrize("prefix", ["c" * 60, "é" * 40])
+def test_long_collection_names_get_distinct_index_names(prefix):
+    # Two collections sharing their first 60 characters must not collapse to one index name:
+    # CREATE INDEX IF NOT EXISTS would then silently leave the second table without its index.
+    first = _index_name(_adapter()._hnsw_index_ddl(prefix + "a"))
+    second = _index_name(_adapter()._hnsw_index_ddl(prefix + "b"))
+    assert first != second
+    assert len(first.encode()) <= 63 and len(second.encode()) <= 63
+
+
+def test_short_collection_name_keeps_the_readable_index_name():
+    assert _index_name(_adapter()._hnsw_index_ddl("Entity_name")) == "ix_Entity_name_vector_hnsw"

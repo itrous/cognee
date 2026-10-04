@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import os
 import re
 from typing import Any, get_type_hints
@@ -41,7 +42,9 @@ QUERY_BATCH_SIZE = 1000
 #   PGVECTOR_HALFVEC=true       new collections get a ``halfvec(N)`` column instead of ``vector(N)``
 #   PGVECTOR_HNSW_INDEX=true    new collections get an HNSW cosine index on that column
 # Existing tables are converted by hand; the adapter only follows the flag for what it creates
-# and inserts, so the flag must match the stored column type.
+# and inserts, so the flag must match the stored column type. PGVECTOR_HNSW_INDEX needs the
+# pgvector extension 0.8.0 or newer (iterative index scans); an older server rejects the
+# ``hnsw.iterative_scan`` setting on the first search instead of returning short results.
 HNSW_INDEX_MAX_LIMIT = 1000
 HNSW_MIN_EF_SEARCH = 100
 
@@ -207,7 +210,13 @@ class PGVectorAdapter(SQLAlchemyAdapter, VectorDBInterface):
         """``CREATE INDEX`` for the collection's vector column, cosine like every search here."""
         opclass = "halfvec_cosine_ops" if _env_flag("PGVECTOR_HALFVEC") else "vector_cosine_ops"
         quote = self.engine.dialect.identifier_preparer.quote
-        index_name = f"ix_{collection_name}_vector_hnsw"[:63]
+        index_name = f"ix_{collection_name}_vector_hnsw"
+        if len(index_name.encode()) > 63:
+            # Postgres keeps 63 bytes of an identifier. Cutting the name there would make two long
+            # collections share an index name, and IF NOT EXISTS would then skip the second one.
+            digest = hashlib.md5(index_name.encode()).hexdigest()[:8]
+            head = index_name.encode()[:54].decode(errors="ignore")
+            index_name = f"{head}_{digest}"
         return (
             f"CREATE INDEX IF NOT EXISTS {quote(index_name)} "
             f"ON {quote(collection_name)} USING hnsw (vector {opclass})"
