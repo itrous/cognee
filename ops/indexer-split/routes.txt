@@ -41,6 +41,9 @@ cognee_indexer DELETE /api/v1/integrations/google/connection
 cognee_indexer DELETE /api/v1/integrations/slack/connection?delete_data=true
 cognee_indexer POST /api/v1/integrations/slack/events
 cognee_api GET /api/v1/integrations/status
+cognee_indexer GET /api/v1/integrations/github/callback?code=x&state=y
+cognee_api GET /api/v1/integrations/github/resources
+cognee_api POST /api/v1/integrations/github/authorize
 cognee_api DELETE /api/v1/agents/abc
 cognee_api DELETE /api/v1/ontologies/k
 cognee_api POST /api/v1/agents/register

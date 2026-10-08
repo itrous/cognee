@@ -2,9 +2,16 @@
 # Проверка маршрутизации шлюза на ЗАГЛУШКАХ: nginx с боевым конфигом и два эхо-сервера
 # с именами cognee и cognee-indexer в отдельной docker-сети. Живой стек и данные
 # не участвуют. Код 0 — все пары «метод путь» ушли туда, куда ожидалось.
+# По умолчанию проверяется ТОТ файл, который монтирует compose (CONF переопределяет),
+# и он обязан совпадать с копией в репозитории.
 set -u
 cd "$(dirname "$0")"
 NET=cognee-route-test-$$
+MOUNTED=/home/itrous/cognee-patches/indexer-split/nginx.conf
+CONF=${CONF:-$MOUNTED}
+if [ "$CONF" = "$MOUNTED" ] && ! cmp -s "$MOUNTED" nginx.conf; then
+  echo "FAIL смонтированный $MOUNTED отличается от ops/indexer-split/nginx.conf"; exit 1
+fi
 STUB='import http.server,os
 class H(http.server.BaseHTTPRequestHandler):
     def _r(self):
@@ -17,10 +24,16 @@ trap cleanup EXIT
 docker network create $NET >/dev/null
 docker run -d --name rt-api-$$ --network $NET --network-alias cognee -e NAME=cognee_api --entrypoint python cognee/cognee:pio-server-aed21d907 -c "$STUB" >/dev/null
 docker run -d --name rt-idx-$$ --network $NET --network-alias cognee-indexer -e NAME=cognee_indexer --entrypoint python cognee/cognee:pio-server-aed21d907 -c "$STUB" >/dev/null
-docker run -d --name rt-gw-$$ --network $NET -v "$(realpath "${CONF:-nginx.conf}"):/etc/nginx/nginx.conf:ro" nginx:1.29-alpine >/dev/null
+docker run -d --name rt-gw-$$ --network $NET -v "$(realpath "$CONF"):/etc/nginx/nginx.conf:ro" nginx:1.29-alpine >/dev/null
 # Клиент — curl из образа cognee (в busybox wget нет произвольных методов).
 docker run -d --name rt-cli-$$ --network $NET --entrypoint sleep cognee/cognee:pio-server-aed21d907 300 >/dev/null
-sleep 3
+# Готовность: шлюз отвечает и оба эхо-сервера достижимы через него.
+for i in $(seq 1 60); do
+  a=$(docker exec rt-cli-$$ curl -sf -m 2 "http://rt-gw-$$:8000/health" 2>/dev/null)
+  b=$(docker exec rt-cli-$$ curl -sf -m 2 -X POST "http://rt-gw-$$:8000/api/v1/cognify" 2>/dev/null)
+  [ "$a" = cognee_api ] && [ "$b" = cognee_indexer ] && break
+  sleep 1
+done
 fail=0; n=0
 while read -r exp m p; do
   [ -z "$exp" ] && continue; n=$((n+1))

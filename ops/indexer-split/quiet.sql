@@ -1,14 +1,25 @@
--- Тихий момент: нет незавершённых remember-jobs и конвейеров за последние 2 часа.
+-- Тихий момент перед остановкой процесса, исполняющего конвейеры.
+-- Запуск: psql -v since="'<StartedAt контейнера>'" -f quiet.sql
+-- Строка, начатая ДО старта нынешнего процесса, не может в нём исполняться: она
+-- помечена stale и тишине не мешает (такие закрывает стартовое восстановление,
+-- remember-job не закрывает никто). Всё начатое после :since — активно, без
+-- ограничения по возрасту.
 with last as (
   select distinct on (pipeline_run_id) pipeline_run_id, pipeline_name, status, created_at
   from pipeline_runs
-  where pipeline_run_id is not null and status is not null and created_at > now() - interval '2 hours'
+  where pipeline_run_id is not null and status is not null
   order by pipeline_run_id, created_at desc
+), open_rows as (
+  select 'pipeline' as kind, pipeline_name as name, created_at as started from last
+   where status::text like '%STARTED%' or status::text like '%INITIATED%'
+  union all
+  select 'remember_job', operation_name, started_at from pipeline_runs
+   where operation_name = 'remember' and outcome is null and ended_at is null
 )
-select 'pipeline' as kind, pipeline_name, status::text, created_at from last
- where status::text like '%STARTED%' or status::text like '%INITIATED%'
+select kind, name, started, 'ACTIVE' as state from open_rows
+ where started >= :since::timestamptz
 union all
-select 'remember_job', operation_name, 'running', started_at from pipeline_runs
- where operation_name = 'remember' and outcome is null and ended_at is null
-   and started_at > now() - interval '2 hours'
-order by 4;
+select 'stale (до :since)', kind, max(started), count(*)::text from open_rows
+ where started < :since::timestamptz group by kind
+order by 3;
+-- Тихо, если нет ни одной строки ACTIVE.

@@ -90,7 +90,7 @@ UI (`NEXT_PUBLIC_LOCAL_API_URL=http://cognee:8000`) серверными мар�
 I1. Маршрутизация проверяется на ЗАГЛУШКАХ, без живого стека и без запросов к данным:
     `ops/indexer-split/route-test.sh` поднимает в отдельной docker-сети nginx с боевым
     `nginx.conf` и два эхо-сервера с именами `cognee` и `cognee-indexer`, затем гоняет
-    `ops/indexer-split/routes.txt` (49 пар «метод путь → ожидаемый процесс»): все маршруты
+    `ops/indexer-split/routes.txt` (52 пар «метод путь → ожидаемый процесс»): все маршруты
     таблицы, включая параметризованные DELETE и строку запроса, и методы API на тех же URI
     (`GET/POST /api/v1/datasets`, `GET /api/v1/skills/{id}`, `PUT /datasets/{id}/schema`,
     `OPTIONS /remember`, DELETE чужих префиксов). Решение не зависит от режима
@@ -126,9 +126,11 @@ I7. Откат одной командой: `cp compose.stack.yml.bak-before-ind
 3. Переключение в две фазы, чтобы окно обрыва было минимальным и видимым:
    а) `up -d cognee-indexer` — API не трогается, индексатор стартует без хост-порта 8000
       (миграции под `pg_advisory_lock`), ждём healthy. Трафик ещё целиком в API.
-   б) тихий момент по БД: `ops/indexer-split/quiet.sql` (только чтение) возвращает ноль
-      строк — нет конвейера с последним статусом `DATASET_PROCESSING_STARTED/INITIATED` и
-      нет remember-job (`operation_name='remember'`, `outcome IS NULL`) за 2 часа; это
+   б) тихий момент по БД: `ops/indexer-split/quiet.sql` (только чтение, `-v since=` — время
+      старта останавливаемого процесса) не даёт ни одной строки ACTIVE — нет конвейера с
+      последним статусом `DATASET_PROCESSING_STARTED/INITIATED` и нет remember-job
+      (`operation_name='remember'`, `outcome IS NULL`), начатых после старта процесса, без
+      ограничения по возрасту; начатое раньше старта в нём исполняться не может; это
       покрывает и окно «job записана, задача не создана», и фазу improve после cognify.
    в) сразу после — `docker compose stop -t 60 cognee`: SIGTERM, gunicorn перестаёт
       принимать соединения и даёт текущим запросам завершиться (graceful_timeout gunicorn
