@@ -9,6 +9,10 @@
 -- остановки), запрос считает ACTIVE. Сверка: исполняющий процесс пишет
 -- «Pipeline run started: `<id>`» в свой лог — нет id в логе живого процесса,
 -- значит строка мертва; её закроет стартовое восстановление через час.
+-- Слепое пятно: операции, у которых нет строки до завершения (`record_operation`
+-- пишет её на выходе) — forget, DELETE-маршруты, импорт skills (`add_skills` без
+-- pipeline run), начало remember content_type=code. Их защищает только graceful
+-- остановка: gunicorn ждёт запросы в полёте 30 с, stop_grace_period 40 с.
 with last as (
   select distinct on (pipeline_run_id) pipeline_run_id, pipeline_name, status, created_at
   from pipeline_runs
