@@ -77,7 +77,13 @@ session/trace отвечают 0,2–1,3 с вместо ~15–25 мс, /health 
 - POST `/api/v1/slack/history/{team}/import`, PUT `/api/v1/slack/history/{team}/sync`,
   POST `/api/v1/integrations/{provider}/sync`, POST `/api/v1/integrations/{provider}/events`
   (импорт истории под `dataset_lock`), DELETE `/api/v1/integrations/{provider}/connection`
-  (с `delete_data` вызывает `forget`)
+  (с `delete_data` вызывает `forget`), GET `/api/v1/integrations/{provider}/callback`
+  (`on_installed` — начальная синхронизация), POST `/api/v1/slack/(commands|events|interactive)`
+  (remember и импорт истории)
+- GET `/api/v1/cognify/subscribe/{run_id}` — WebSocket прогресса конвейера: очередь
+  `pipeline_run_info_queues` живёт в памяти процесса, исполняющего конвейер. Шлюз
+  пробрасывает `Upgrade`/`Connection` (иначе любой WebSocket через него — 404;
+  `/visualize/subscribe` опрашивает БД и остаётся в API).
 
 nginx: `client_max_body_size 0`, `proxy_read_timeout/send_timeout 3600s`,
 `proxy_buffering off`, HTTP/1.1 keepalive к апстримам, `Host` и `X-Forwarded-*`
@@ -90,7 +96,7 @@ UI (`NEXT_PUBLIC_LOCAL_API_URL=http://cognee:8000`) серверными мар�
 I1. Маршрутизация проверяется на ЗАГЛУШКАХ, без живого стека и без запросов к данным:
     `ops/indexer-split/route-test.sh` поднимает в отдельной docker-сети nginx с боевым
     `nginx.conf` и два эхо-сервера с именами `cognee` и `cognee-indexer`, затем гоняет
-    `ops/indexer-split/routes.txt` (52 пар «метод путь → ожидаемый процесс»): все маршруты
+    `ops/indexer-split/routes.txt` (58 пар «метод путь → ожидаемый процесс»): все маршруты
     таблицы, включая параметризованные DELETE и строку запроса, и методы API на тех же URI
     (`GET/POST /api/v1/datasets`, `GET /api/v1/skills/{id}`, `PUT /datasets/{id}/schema`,
     `OPTIONS /remember`, DELETE чужих префиксов). Решение не зависит от режима

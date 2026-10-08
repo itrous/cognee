@@ -50,3 +50,9 @@ cognee_api POST /api/v1/agents/register
 cognee_api GET /api/v1/visualize
 cognee_api GET /health
 cognee_api GET /
+cognee_indexer GET /api/v1/cognify/subscribe/0000
+cognee_api GET /api/v1/visualize/subscribe/0000
+cognee_indexer POST /api/v1/slack/commands
+cognee_indexer POST /api/v1/slack/events
+cognee_indexer POST /api/v1/slack/interactive
+cognee_api GET /api/v1/slack/channels
