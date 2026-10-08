@@ -1,0 +1,31 @@
+#!/bin/bash
+# Проверка маршрутизации шлюза на ЗАГЛУШКАХ: nginx с боевым конфигом и два эхо-сервера
+# с именами cognee и cognee-indexer в отдельной docker-сети. Живой стек и данные
+# не участвуют. Код 0 — все пары «метод путь» ушли туда, куда ожидалось.
+set -u
+cd "$(dirname "$0")"
+NET=cognee-route-test-$$
+STUB='import http.server,os
+class H(http.server.BaseHTTPRequestHandler):
+    def _r(self):
+        b=os.environ["NAME"].encode(); self.send_response(200); self.send_header("Content-Length",str(len(b))); self.end_headers(); self.wfile.write(b)
+    do_GET=do_POST=do_PUT=do_PATCH=do_DELETE=do_OPTIONS=_r
+    def log_message(self,*a): pass
+http.server.ThreadingHTTPServer(("0.0.0.0",8000),H).serve_forever()'
+cleanup() { docker rm -f rt-api-$$ rt-idx-$$ rt-gw-$$ rt-cli-$$ >/dev/null 2>&1; docker network rm $NET >/dev/null 2>&1; }
+trap cleanup EXIT
+docker network create $NET >/dev/null
+docker run -d --name rt-api-$$ --network $NET --network-alias cognee -e NAME=cognee_api --entrypoint python cognee/cognee:pio-server-aed21d907 -c "$STUB" >/dev/null
+docker run -d --name rt-idx-$$ --network $NET --network-alias cognee-indexer -e NAME=cognee_indexer --entrypoint python cognee/cognee:pio-server-aed21d907 -c "$STUB" >/dev/null
+docker run -d --name rt-gw-$$ --network $NET -v "$(realpath "${CONF:-nginx.conf}"):/etc/nginx/nginx.conf:ro" nginx:1.29-alpine >/dev/null
+# Клиент — curl из образа cognee (в busybox wget нет произвольных методов).
+docker run -d --name rt-cli-$$ --network $NET --entrypoint sleep cognee/cognee:pio-server-aed21d907 300 >/dev/null
+sleep 3
+fail=0; n=0
+while read -r exp m p; do
+  [ -z "$exp" ] && continue; n=$((n+1))
+  got=$(docker exec rt-cli-$$ curl -sf -m 10 -X "$m" "http://rt-gw-$$:8000$p" || echo ERR)
+  [ "$got" = "$exp" ] || { fail=$((fail+1)); echo "FAIL $m $p -> $got (ждали $exp)"; }
+done < routes.txt
+echo "проверено $n, ошибок $fail"
+[ $fail -eq 0 ]

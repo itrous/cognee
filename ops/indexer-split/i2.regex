@@ -1,0 +1,1 @@
+"(POST /api/v1/(remember|add|cognify|memify|improve|forget|skills|sync|responses/?)[ ?]|PATCH /api/v1/update[ ?]|DELETE /api/v1/(delete|datasets|skills)[/ ?]|GET /api/v1/remember/jobs/|(POST|PUT) /api/v1/(slack/history/[^/ ]+/(import|sync)|integrations/[^/ ]+/(sync|events))[ ?]|DELETE /api/v1/integrations/[^/ ]+/connection[ ?])
