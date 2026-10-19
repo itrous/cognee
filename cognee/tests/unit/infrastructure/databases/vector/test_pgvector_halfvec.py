@@ -226,15 +226,26 @@ class _FakeQuery:
     def limit(self, *_args, **_kwargs):
         return self
 
+    def select_from(self, *_args, **_kwargs):
+        return _CountQuery()
+
+
+class _CountQuery(_FakeQuery):
+    """The row count a search with ``limit=None`` takes first."""
+
 
 class _SearchSession:
     """A SELECT answers with the next queued row set; any other statement is only recorded."""
 
-    def __init__(self, *row_sets):
+    def __init__(self, *row_sets, count=None):
         self.row_sets = list(row_sets)
+        self.count = count
         self.log = []
 
     async def execute(self, statement):
+        if isinstance(statement, _CountQuery):
+            self.log.append("COUNT")
+            return SimpleNamespace(scalar_one=lambda: self.count)
         if isinstance(statement, _FakeQuery):
             self.log.append("SELECT")
             rows = self.row_sets.pop(0)
@@ -280,12 +291,13 @@ def _tuned(limit):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("hnsw", "node_name", "limit", "row_sets", "log", "scores"),
+    ("hnsw", "node_name", "limit", "count", "row_sets", "log", "scores"),
     [
         pytest.param(
             True,
             ["A"],
             3,
+            None,
             [_distances(0.1, 0.2, 0.3)],
             [*_tuned(3), "SELECT"],
             [0.1, 0.2, 0.3],
@@ -295,6 +307,7 @@ def _tuned(limit):
             True,
             ["A"],
             3,
+            None,
             [_distances(0.4), _distances(0.1, 0.2, 0.3)],
             [*_tuned(3), "SELECT", _EXACT, "SELECT"],
             [0.1, 0.2, 0.3],
@@ -304,6 +317,7 @@ def _tuned(limit):
             True,
             ["A"],
             3,
+            None,
             [[], []],
             [*_tuned(3), "SELECT", _EXACT, "SELECT"],
             [],
@@ -313,6 +327,7 @@ def _tuned(limit):
             True,
             ["A"],
             1000,
+            None,
             [_distances(0.4), _distances(0.1, 0.4)],
             [*_tuned(1000), "SELECT", _EXACT, "SELECT"],
             [0.1, 0.4],
@@ -322,6 +337,7 @@ def _tuned(limit):
             True,
             ["A"],
             1001,
+            None,
             [_distances(0.4)],
             [_EXACT, "SELECT"],
             [0.4],
@@ -331,6 +347,7 @@ def _tuned(limit):
             True,
             None,
             3,
+            None,
             [_distances(0.4)],
             [*_tuned(3), "SELECT"],
             [0.4],
@@ -340,21 +357,42 @@ def _tuned(limit):
             False,
             ["A"],
             3,
+            None,
             [_distances(0.4)],
             ["SELECT"],
             [0.4],
             id="index-flag-off-leaves-the-scan-alone",
         ),
+        pytest.param(
+            True,
+            ["A"],
+            None,
+            3,
+            [_distances(0.4), _distances(0.1, 0.2)],
+            ["COUNT", *_tuned(3), "SELECT", _EXACT, "SELECT"],
+            [0.1, 0.2],
+            id="whole-small-collection-filtered-is-rechecked",
+        ),
+        pytest.param(
+            True,
+            ["A"],
+            None,
+            5000,
+            [_distances(0.4)],
+            ["COUNT", _EXACT, "SELECT"],
+            [0.4],
+            id="whole-large-collection-filtered-is-exact-once",
+        ),
     ],
 )
 async def test_filtered_search_uses_the_index_and_rechecks_only_a_short_answer(
-    monkeypatch, hnsw, node_name, limit, row_sets, log, scores
+    monkeypatch, hnsw, node_name, limit, count, row_sets, log, scores
 ):
     if hnsw:
         monkeypatch.setenv("PGVECTOR_HNSW_INDEX", "true")
     else:
         monkeypatch.delenv("PGVECTOR_HNSW_INDEX", raising=False)
-    session = _SearchSession(*row_sets)
+    session = _SearchSession(*row_sets, count=count)
     adapter = _search_adapter(monkeypatch, session)
 
     results = await adapter.search(
