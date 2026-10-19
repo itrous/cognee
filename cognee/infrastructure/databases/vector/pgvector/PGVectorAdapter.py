@@ -731,9 +731,6 @@ class PGVectorAdapter(SQLAlchemyAdapter, VectorDBInterface):
         if limit <= 0:
             return []
 
-        # NOTE: This needs to be initialized in case search doesn't return a value
-        closest_items = []
-
         # Never select the vector column: results carry only id, payload and distance,
         # and the distance is computed in the database. Fetching vectors made a
         # limit=None search (node-set filtered retrieval reads whole collections)
@@ -778,16 +775,25 @@ class PGVectorAdapter(SQLAlchemyAdapter, VectorDBInterface):
             if limit > 0:
                 query = query.limit(limit)
 
-            if _env_flag("PGVECTOR_HNSW_INDEX"):
-                await self._tune_index_scan(session, limit, filtered=bool(node_name))
+            hnsw = _env_flag("PGVECTOR_HNSW_INDEX")
+            if hnsw:
+                await self._tune_index_scan(session, limit)
 
             # Find closest vectors to query_vector
-            closest_items = await session.execute(query)
+            rows = (await session.execute(query)).all()
+
+            # An iterative HNSW scan gives up after hnsw.max_scan_tuples (20000) candidates, so
+            # rows that match a rare tag but sit far from the query can be dropped. A short
+            # filtered result is therefore rechecked by the exact scan; a full one is kept, so a
+            # common tag stays on the index.
+            if hnsw and node_name and len(rows) < limit <= HNSW_INDEX_MAX_LIMIT:
+                await session.execute(text("SET LOCAL enable_indexscan = off"))
+                rows = (await session.execute(query)).all()
 
         vector_list = []
 
         # Extract distances and find min/max for normalization
-        for vector in closest_items.all():
+        for vector in rows:
             vector_list.append(
                 {
                     "id": parse_id(str(vector.id)),
@@ -813,7 +819,7 @@ class PGVectorAdapter(SQLAlchemyAdapter, VectorDBInterface):
             for row in vector_list
         ]
 
-    async def _tune_index_scan(self, session, limit: int, filtered: bool = False) -> None:
+    async def _tune_index_scan(self, session, limit: int) -> None:
         """Keep an HNSW scan from returning fewer rows than the exact scan it replaces.
 
         A bounded top-k uses the index with ``ef_search`` at least as wide as k, and strict
@@ -823,11 +829,10 @@ class PGVectorAdapter(SQLAlchemyAdapter, VectorDBInterface):
         very large k (the
         callers that pass ``limit=None`` want every row ranked) must not use the index at all: a
         graph scan stops after ``ef_search`` candidates and would silently truncate the result.
-        Neither may a ``belongs_to_set`` filter: an iterative scan gives up after
-        ``hnsw.max_scan_tuples`` (20000) candidates, so rows that match a rare tag but sit far
-        from the query are silently dropped.
+        A ``belongs_to_set`` filter keeps the index; ``search`` rechecks a short filtered result
+        with the exact scan.
         """
-        if filtered or limit > HNSW_INDEX_MAX_LIMIT:
+        if limit > HNSW_INDEX_MAX_LIMIT:
             await session.execute(text("SET LOCAL enable_indexscan = off"))
             return
         await session.execute(
