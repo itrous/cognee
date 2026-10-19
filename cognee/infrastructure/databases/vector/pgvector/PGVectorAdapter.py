@@ -52,6 +52,7 @@ HNSW_MIN_EF_SEARCH = 100
 def _env_flag(name: str) -> bool:
     return os.getenv(name, "").strip().lower() in ("1", "true", "yes", "on")
 
+
 # Default pool sizing for per-dataset PGVector engines when ENABLE_BACKEND_ACCESS_CONTROL=True.
 # Lean pool_size limits connection fan-out across datasets (only pool_size connections are
 # retained while idle); the large max_overflow keeps burst headroom, since overflow
