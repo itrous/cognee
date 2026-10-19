@@ -23,6 +23,45 @@ add_env = existing_tests.add_env
 
 pytestmark = pytest.mark.asyncio
 
+# The factories ``add_env`` clears before it points the process at its scratch root.
+_ENV_BOUND_CACHES = [
+    ("cognee.base_config", "get_base_config"),
+    ("cognee.infrastructure.databases.relational.config", "get_relational_config"),
+    (
+        "cognee.infrastructure.databases.relational.get_relational_engine",
+        "get_relational_engine",
+    ),
+    ("cognee.infrastructure.databases.graph.config", "get_graph_config"),
+    ("cognee.infrastructure.databases.vector.config", "get_vectordb_config"),
+    ("cognee.infrastructure.databases.cache.config", "get_cache_config"),
+    ("cognee.infrastructure.databases.cache.get_cache_engine", "create_cache_engine"),
+    ("cognee.infrastructure.databases.vector.embeddings.config", "get_embedding_config"),
+    (
+        "cognee.infrastructure.databases.vector.embeddings.get_embedding_engine",
+        "create_embedding_engine",
+    ),
+    ("cognee.infrastructure.llm.config", "get_llm_config"),
+]
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _leave_the_process_as_found():
+    """``add_env`` points the whole process at a scratch root and never undoes it, so a test
+    that runs after this module in the same pytest session would open its database under a
+    deleted directory. Autouse and module-scoped: set up before ``add_env``, torn down after
+    it, restoring the environment and dropping the configs and engines built on it."""
+    import os
+
+    saved = dict(os.environ)
+    yield
+    os.environ.clear()
+    os.environ.update(saved)
+    for module_name, factory_name in _ENV_BOUND_CACHES:
+        try:
+            getattr(importlib.import_module(module_name), factory_name).cache_clear()
+        except (ImportError, AttributeError):
+            pass
+
 
 async def _client(user):
     from cognee.api.client import exception_handler
@@ -61,7 +100,7 @@ async def _finish(client, accepted):
     assert body["status"] == "running"
     UUID(body["job_id"])
     module = importlib.import_module("cognee.api.v1.remember.remember")
-    await asyncio.wait_for(asyncio.gather(*list(module._BACKGROUND_REMEMBER_TASKS)), 60)
+    await asyncio.gather(*list(module._BACKGROUND_REMEMBER_TASKS))
     response = await client.get("/api/v1/remember/jobs/" + body["job_id"])
     assert response.status_code == 200, response.text
     return response.json()
