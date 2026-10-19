@@ -814,10 +814,13 @@ class PGVectorAdapter(SQLAlchemyAdapter, VectorDBInterface):
         ]
 
     async def _tune_index_scan(self, session, limit: int, filtered: bool = False) -> None:
-        """Make an HNSW scan answer like the exact scan it replaces.
+        """Keep an HNSW scan from returning fewer rows than the exact scan it replaces.
 
         A bounded top-k uses the index with ``ef_search`` at least as wide as k, and strict
-        iterative scan so the order matches the exact scan. An unbounded or very large k (the
+        iterative scan so the rows come back in distance order. The index is approximate: the k
+        rows it finds may differ from the exact top-k (recall below 1); that is the speed it
+        trades for, and turning PGVECTOR_HNSW_INDEX off restores the exact scan. An unbounded or
+        very large k (the
         callers that pass ``limit=None`` want every row ranked) must not use the index at all: a
         graph scan stops after ``ef_search`` candidates and would silently truncate the result.
         Neither may a ``belongs_to_set`` filter: an iterative scan gives up after
