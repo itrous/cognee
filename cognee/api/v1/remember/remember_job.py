@@ -55,6 +55,29 @@ def _json_safe(payload: dict) -> dict:
     return json.loads(json.dumps(payload, default=str))
 
 
+def _scrub_exception_text(node: Any) -> None:
+    """Scrub, in place, every exception text in a JSON-shaped job snapshot before it is stored
+    and served: ``improve_error``, ``error`` and ``error_message`` at any depth (improve stages,
+    rerun passes, nested pipeline runs), and the ``payload`` of an errored pipeline run, which
+    holds the exception's repr."""
+    from cognee.modules.operations import scrub_error_message
+
+    if isinstance(node, list):
+        for item in node:
+            _scrub_exception_text(item)
+        return
+    if not isinstance(node, dict):
+        return
+    keys = ["improve_error", "error", "error_message"]
+    if node.get("status") == "PipelineRunErrored":
+        keys.append("payload")
+    for key in keys:
+        if isinstance(node.get(key), str) and node[key]:
+            node[key] = scrub_error_message(node[key])
+    for value in node.values():
+        _scrub_exception_text(value)
+
+
 def build_job_snapshot(result, job_id: UUID) -> dict:
     """The stored/served view of one job, built from its ``RememberResult``.
 
@@ -81,20 +104,8 @@ def build_job_snapshot(result, job_id: UUID) -> dict:
     else:
         for key in ("error", "error_class", "error_http_status"):
             snapshot.pop(key, None)
-    # Exception text, like ``error``: scrubbed before it is stored and served. The improve
-    # result carries the same text per stage (and per rerun pass), not only in improve_error.
-    from cognee.modules.operations import scrub_error_message
-
-    if snapshot.get("improve_error"):
-        snapshot["improve_error"] = scrub_error_message(snapshot["improve_error"])
-    improve = snapshot.get("improve")
-    if isinstance(improve, dict):
-        stages = list(improve.get("stages") or [])
-        for rerun in improve.get("rerun_passes") or []:
-            stages.extend(rerun or [])
-        for item in [improve, *stages]:
-            if isinstance(item, dict) and item.get("error"):
-                item["error"] = scrub_error_message(item["error"])
+    snapshot = _json_safe(snapshot)
+    _scrub_exception_text(snapshot)
     return _json_safe(
         {
             "version": REMEMBER_JOB_VERSION,
