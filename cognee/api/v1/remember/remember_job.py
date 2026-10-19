@@ -125,6 +125,7 @@ async def insert_running_job(context: "OperationContext", result) -> None:
         error_message=None,
         tokens_in=None,
         tokens_out=None,
+        embedding_tokens=None,
         origin=get_operation_origin(),
         session_id=context.session_id,
         parent_operation_id=context.parent_operation_id,
@@ -161,6 +162,7 @@ async def finish_job(context: "OperationContext", result) -> bool:
             "error_message": snapshot.get("error") if failed else None,
             "tokens_in": context.usage.tokens_in,
             "tokens_out": context.usage.tokens_out,
+            "embedding_tokens": context.usage.embedding_tokens,
         }
 
         db_engine = get_relational_engine()
