@@ -19,6 +19,10 @@ def launch(monkeypatch, tmp_path):
         process.wait.return_value = 0
     mocks = {
         "_check_required_ports": MagicMock(return_value=(True, [])),
+        # start_ui probes the MCP port itself with a real socket connect; a host that already
+        # serves something there (a running cognee stack on 8001) would silently drop the MCP
+        # process these tests expect to own.
+        "_is_port_available": MagicMock(return_value=True),
         "_check_docker_available": MagicMock(return_value=(True, "ready")),
         "_stream_process_output": MagicMock(),
         "find_frontend_path": MagicMock(return_value=tmp_path),
