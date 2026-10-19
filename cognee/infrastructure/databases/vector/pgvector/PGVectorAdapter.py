@@ -47,6 +47,7 @@ QUERY_BATCH_SIZE = 1000
 # ``hnsw.iterative_scan`` setting on the first search instead of returning short results.
 HNSW_INDEX_MAX_LIMIT = 1000
 HNSW_MIN_EF_SEARCH = 100
+HNSW_MAX_DIMENSIONS = {"vector": 2000, "halfvec": 4000}
 
 
 def _env_flag(name: str) -> bool:
@@ -206,6 +207,10 @@ class PGVectorAdapter(SQLAlchemyAdapter, VectorDBInterface):
 
             return HALFVEC(vector_size)
         return self.Vector(vector_size)
+
+    def _hnsw_dimension_limit(self) -> int:
+        """Widest column pgvector builds an HNSW index on, for the column type the flag picks."""
+        return HNSW_MAX_DIMENSIONS["halfvec" if _env_flag("PGVECTOR_HALFVEC") else "vector"]
 
     def _hnsw_index_ddl(self, collection_name: str) -> str:
         """``CREATE INDEX`` for the collection's vector column, cosine like every search here."""
@@ -410,7 +415,21 @@ class PGVectorAdapter(SQLAlchemyAdapter, VectorDBInterface):
                                 Base.metadata.create_all, tables=[PGVectorDataPoint.__table__]
                             )
                         if _env_flag("PGVECTOR_HNSW_INDEX"):
-                            await connection.exec_driver_sql(self._hnsw_index_ddl(collection_name))
+                            if vector_size <= self._hnsw_dimension_limit():
+                                await connection.exec_driver_sql(
+                                    self._hnsw_index_ddl(collection_name)
+                                )
+                            else:
+                                # pgvector refuses the index, and the failed CREATE INDEX
+                                # would roll the table back with it: keep the collection
+                                # and let its searches scan the table.
+                                logger.warning(
+                                    "PGVECTOR_HNSW_INDEX: %s has %d dimensions, over the HNSW "
+                                    "limit of %d for its column type; created without an index",
+                                    collection_name,
+                                    vector_size,
+                                    self._hnsw_dimension_limit(),
+                                )
                     # Reflect AFTER the DDL transaction commits so
                     # _metadata is never populated for a table that
                     # might be rolled back.
@@ -760,7 +779,7 @@ class PGVectorAdapter(SQLAlchemyAdapter, VectorDBInterface):
                 query = query.limit(limit)
 
             if _env_flag("PGVECTOR_HNSW_INDEX"):
-                await self._tune_index_scan(session, limit)
+                await self._tune_index_scan(session, limit, filtered=bool(node_name))
 
             # Find closest vectors to query_vector
             closest_items = await session.execute(query)
@@ -794,16 +813,18 @@ class PGVectorAdapter(SQLAlchemyAdapter, VectorDBInterface):
             for row in vector_list
         ]
 
-    async def _tune_index_scan(self, session, limit: int) -> None:
+    async def _tune_index_scan(self, session, limit: int, filtered: bool = False) -> None:
         """Make an HNSW scan answer like the exact scan it replaces.
 
         A bounded top-k uses the index with ``ef_search`` at least as wide as k, and strict
-        iterative scan so a ``belongs_to_set`` filter keeps scanning until k rows survive it
-        (a plain scan returns fewer). An unbounded or very large k (the callers that pass
-        ``limit=None`` want every row ranked) must not use the index at all: a graph scan stops
-        after ``ef_search`` candidates and would silently truncate the result.
+        iterative scan so the order matches the exact scan. An unbounded or very large k (the
+        callers that pass ``limit=None`` want every row ranked) must not use the index at all: a
+        graph scan stops after ``ef_search`` candidates and would silently truncate the result.
+        Neither may a ``belongs_to_set`` filter: an iterative scan gives up after
+        ``hnsw.max_scan_tuples`` (20000) candidates, so rows that match a rare tag but sit far
+        from the query are silently dropped.
         """
-        if limit > HNSW_INDEX_MAX_LIMIT:
+        if filtered or limit > HNSW_INDEX_MAX_LIMIT:
             await session.execute(text("SET LOCAL enable_indexscan = off"))
             return
         await session.execute(
