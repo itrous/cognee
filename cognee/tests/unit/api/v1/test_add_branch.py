@@ -14,6 +14,7 @@ from uuid import uuid4
 import pytest
 
 from cognee.api.v1.serve import state as serve_state
+from cognee.modules.pipelines.models.PipelineRunInfo import PipelineRunCompleted
 
 add_module = importlib.import_module("cognee.api.v1.add.add")
 remember_module = importlib.import_module("cognee.api.v1.remember.remember")
@@ -70,6 +71,9 @@ async def test_remember_passes_the_branch_to_add_and_not_to_cognify():
 
     user = MagicMock(id=uuid4())
     dataset = MagicMock(id=uuid4())
+    run_info = PipelineRunCompleted(
+        pipeline_run_id=uuid4(), dataset_id=dataset.id, dataset_name="code"
+    )
 
     with (
         patch("cognee.shared.utils.send_telemetry"),
@@ -81,8 +85,11 @@ async def test_remember_passes_the_branch_to_add_and_not_to_cognify():
             "resolve_authorized_user_datasets",
             AsyncMock(return_value=(user, [dataset])),
         ),
-        patch("cognee.api.v1.add.add", AsyncMock()) as add,
-        patch("cognee.api.v1.cognify.cognify", AsyncMock(return_value={})) as cognify,
+        patch("cognee.api.v1.add.add", AsyncMock(return_value=run_info)) as add,
+        patch(
+            "cognee.api.v1.cognify.cognify",
+            AsyncMock(return_value={run_info.dataset_id: run_info}),
+        ) as cognify,
     ):
         await cognee.remember(_REPO, dataset_name="code", branch="dev", self_improvement=False)
 
