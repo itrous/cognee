@@ -1,10 +1,12 @@
 """Opt-in halfvec columns, HNSW index and scan tuning of the pgvector adapter, and the
 client-side Matryoshka cut in the OpenAI-compatible embedding engine."""
 
+import asyncio
 import math
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
+from uuid import uuid4
 
 import numpy as np
 import pytest
@@ -12,8 +14,10 @@ import pytest
 pytest.importorskip("asyncpg")
 pytest.importorskip("pgvector")
 
+from sqlalchemy import MetaData
 from sqlalchemy.dialects import postgresql
 
+import cognee.infrastructure.databases.vector.pgvector.PGVectorAdapter as pg_module
 from cognee.infrastructure.databases.vector.embeddings.OpenAICompatibleEmbeddingEngine import (
     OpenAICompatibleEmbeddingEngine,
 )
@@ -205,3 +209,234 @@ def test_long_collection_names_get_distinct_index_names(prefix):
 
 def test_short_collection_name_keeps_the_readable_index_name():
     assert _index_name(_adapter()._hnsw_index_ddl("Entity_name")) == "ix_Entity_name_vector_hnsw"
+
+
+# --- filtered search: the index first, the exact scan only for a short answer ----------------
+
+
+class _FakeQuery:
+    """Stands in for the SQLAlchemy select: every builder step returns itself."""
+
+    def where(self, *_args, **_kwargs):
+        return self
+
+    def order_by(self, *_args, **_kwargs):
+        return self
+
+    def limit(self, *_args, **_kwargs):
+        return self
+
+
+class _SearchSession:
+    """A SELECT answers with the next queued row set; any other statement is only recorded."""
+
+    def __init__(self, *row_sets):
+        self.row_sets = list(row_sets)
+        self.log = []
+
+    async def execute(self, statement):
+        if isinstance(statement, _FakeQuery):
+            self.log.append("SELECT")
+            rows = self.row_sets.pop(0)
+            return SimpleNamespace(all=lambda: rows)
+        self.log.append(str(statement))
+        return SimpleNamespace()
+
+
+def _distances(*values):
+    return [SimpleNamespace(id=str(uuid4()), payload=None, similarity=v) for v in values]
+
+
+def _search_adapter(monkeypatch, session):
+    monkeypatch.setattr(pg_module, "select", lambda *_args, **_kwargs: _FakeQuery())
+    distance = SimpleNamespace(label=lambda _name: "distance_col")
+    table = SimpleNamespace(
+        c=SimpleNamespace(
+            id="id_col",
+            payload="payload_col",
+            vector=SimpleNamespace(cosine_distance=lambda _vector: distance),
+        )
+    )
+    adapter = _adapter()
+    adapter.get_table = AsyncMock(return_value=table)
+
+    @asynccontextmanager
+    async def get_async_session():
+        yield session
+
+    adapter.get_async_session = get_async_session
+    return adapter
+
+
+_EXACT = "SET LOCAL enable_indexscan = off"
+
+
+def _tuned(limit):
+    return [
+        f"SET LOCAL hnsw.ef_search = {max(100, limit)}",
+        "SET LOCAL hnsw.iterative_scan = strict_order",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("hnsw", "node_name", "limit", "row_sets", "log", "scores"),
+    [
+        pytest.param(
+            True,
+            ["A"],
+            3,
+            [_distances(0.1, 0.2, 0.3)],
+            [*_tuned(3), "SELECT"],
+            [0.1, 0.2, 0.3],
+            id="filtered-full-answer-stays-on-the-index",
+        ),
+        pytest.param(
+            True,
+            ["A"],
+            3,
+            [_distances(0.4), _distances(0.1, 0.2, 0.3)],
+            [*_tuned(3), "SELECT", _EXACT, "SELECT"],
+            [0.1, 0.2, 0.3],
+            id="filtered-short-answer-is-rechecked-exactly",
+        ),
+        pytest.param(
+            True,
+            ["A"],
+            3,
+            [[], []],
+            [*_tuned(3), "SELECT", _EXACT, "SELECT"],
+            [],
+            id="filtered-empty-answer-is-rechecked-and-may-stay-empty",
+        ),
+        pytest.param(
+            True,
+            ["A"],
+            1000,
+            [_distances(0.4), _distances(0.1, 0.4)],
+            [*_tuned(1000), "SELECT", _EXACT, "SELECT"],
+            [0.1, 0.4],
+            id="filtered-short-answer-at-the-bound-1000-is-rechecked",
+        ),
+        pytest.param(
+            True,
+            ["A"],
+            1001,
+            [_distances(0.4)],
+            [_EXACT, "SELECT"],
+            [0.4],
+            id="filtered-above-the-bound-is-exact-once",
+        ),
+        pytest.param(
+            True,
+            None,
+            3,
+            [_distances(0.4)],
+            [*_tuned(3), "SELECT"],
+            [0.4],
+            id="unfiltered-short-answer-is-final",
+        ),
+        pytest.param(
+            False,
+            ["A"],
+            3,
+            [_distances(0.4)],
+            ["SELECT"],
+            [0.4],
+            id="index-flag-off-leaves-the-scan-alone",
+        ),
+    ],
+)
+async def test_filtered_search_uses_the_index_and_rechecks_only_a_short_answer(
+    monkeypatch, hnsw, node_name, limit, row_sets, log, scores
+):
+    if hnsw:
+        monkeypatch.setenv("PGVECTOR_HNSW_INDEX", "true")
+    else:
+        monkeypatch.delenv("PGVECTOR_HNSW_INDEX", raising=False)
+    session = _SearchSession(*row_sets)
+    adapter = _search_adapter(monkeypatch, session)
+
+    results = await adapter.search(
+        "Entity_name", query_vector=[0.1, 0.2, 0.3], limit=limit, node_name=node_name
+    )
+
+    assert session.log == log
+    assert [result.score for result in results] == scores
+    # Every queued row set was needed: nothing is fetched twice by accident or left unread.
+    assert session.row_sets == []
+
+
+# --- a collection wider than pgvector can index is created without the index ------------------
+
+
+class _Begin:
+    def __init__(self, connection):
+        self.connection = connection
+
+    async def __aenter__(self):
+        return self.connection
+
+    async def __aexit__(self, *_exc):
+        return False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("halfvec", "size", "indexed"),
+    [
+        pytest.param(True, 2048, True, id="halfvec-2048"),
+        pytest.param(True, 4000, True, id="halfvec-at-its-limit"),
+        pytest.param(True, 4001, False, id="halfvec-over-its-limit"),
+        pytest.param(False, 2000, True, id="vector-at-its-limit"),
+        pytest.param(False, 2001, False, id="vector-over-its-limit"),
+        pytest.param(False, 2048, False, id="vector-2048-with-the-halfvec-flag-off"),
+    ],
+)
+async def test_wide_collection_is_created_without_an_index_pgvector_would_refuse(
+    monkeypatch, halfvec, size, indexed
+):
+    from pgvector.sqlalchemy import HALFVEC, Vector
+
+    monkeypatch.setenv("PGVECTOR_HNSW_INDEX", "true")
+    if halfvec:
+        monkeypatch.setenv("PGVECTOR_HALFVEC", "true")
+    else:
+        monkeypatch.delenv("PGVECTOR_HALFVEC", raising=False)
+    warning = MagicMock()
+    monkeypatch.setattr(pg_module, "logger", MagicMock(warning=warning))
+    connection = SimpleNamespace(run_sync=AsyncMock(), exec_driver_sql=AsyncMock())
+    adapter = _adapter()
+    adapter.embedding_engine = SimpleNamespace(get_vector_size=lambda: size)
+    adapter.has_collection = AsyncMock(return_value=False)
+    adapter.VECTOR_DB_LOCK = asyncio.Lock()
+    adapter._metadata = MetaData()
+    adapter.engine = SimpleNamespace(dialect=postgresql.dialect(), begin=lambda: _Begin(connection))
+    collection = f"wide_{'halfvec' if halfvec else 'vector'}_{size}"
+
+    try:
+        await adapter.create_collection(collection)
+
+        # The table is created either way: a refused CREATE INDEX would roll it back with it.
+        created = [call for call in connection.run_sync.await_args_list if "tables" in call.kwargs]
+        assert len(created) == 1
+        (table,) = created[0].kwargs["tables"]
+        assert table.name == collection
+        assert type(table.c.vector.type) is (HALFVEC if halfvec else Vector)
+        assert table.c.vector.type.dim == size
+        opclass = "halfvec_cosine_ops" if halfvec else "vector_cosine_ops"
+        if indexed:
+            assert connection.exec_driver_sql.await_count == 1
+            assert opclass in connection.exec_driver_sql.await_args.args[0]
+            warning.assert_not_called()
+        else:
+            connection.exec_driver_sql.assert_not_awaited()
+            warning.assert_called_once()
+            limit = 4000 if halfvec else 2000
+            assert warning.call_args.args[1:] == (collection, size, limit)
+        # The collection is still reflected afterwards, so searches can use it.
+        assert connection.run_sync.await_args.kwargs == {"only": [collection]}
+    finally:
+        registered = pg_module.Base.metadata.tables.get(collection)
+        if registered is not None:
+            pg_module.Base.metadata.remove(registered)
