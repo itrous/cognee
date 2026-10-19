@@ -81,11 +81,20 @@ def build_job_snapshot(result, job_id: UUID) -> dict:
     else:
         for key in ("error", "error_class", "error_http_status"):
             snapshot.pop(key, None)
-    if snapshot.get("improve_error"):
-        # Exception text, like ``error``: scrubbed before it is stored and served.
-        from cognee.modules.operations import scrub_error_message
+    # Exception text, like ``error``: scrubbed before it is stored and served. The improve
+    # result carries the same text per stage (and per rerun pass), not only in improve_error.
+    from cognee.modules.operations import scrub_error_message
 
+    if snapshot.get("improve_error"):
         snapshot["improve_error"] = scrub_error_message(snapshot["improve_error"])
+    improve = snapshot.get("improve")
+    if isinstance(improve, dict):
+        stages = list(improve.get("stages") or [])
+        for rerun in improve.get("rerun_passes") or []:
+            stages.extend(rerun or [])
+        for item in [improve, *stages]:
+            if isinstance(item, dict) and item.get("error"):
+                item["error"] = scrub_error_message(item["error"])
     return _json_safe(
         {
             "version": REMEMBER_JOB_VERSION,
