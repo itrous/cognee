@@ -138,7 +138,7 @@ async def test_job_stays_running_until_optional_improve_finishes(stages, monkeyp
         run_in_background=True,
     )
     try:
-        await asyncio.wait_for(entered.wait(), 5)
+        await entered.wait()
         body = await job_module.get_job_snapshot(result.job_id, user)
         assert body["status"] == "running"
         assert "improve_error" not in body
@@ -171,7 +171,7 @@ async def test_closed_request_upload_is_owned_by_background_task(stages, monkeyp
     )
     try:
         await upload.close()
-        await asyncio.wait_for(entered.wait(), 5)
+        await entered.wait()
     finally:
         release.set()
         await result

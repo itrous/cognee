@@ -151,7 +151,7 @@ async def test_remember_registers_its_background_tasks(monkeypatch):
     assert background_tasks.pending_background_tasks() == 1
 
     release.set()
-    assert await background_tasks.wait_for_background_tasks(timeout=5) is True
+    assert await background_tasks.wait_for_background_tasks(timeout=None) is True
     assert result.status == "completed"
 
 

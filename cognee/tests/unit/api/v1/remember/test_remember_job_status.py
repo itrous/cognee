@@ -315,7 +315,7 @@ async def test_terminal_state_is_written_once(stages):
     context = SimpleNamespace(
         operation_id=__import__("uuid").UUID(result.job_id),
         run_info=None,
-        usage=SimpleNamespace(tokens_in=0, tokens_out=0),
+        usage=SimpleNamespace(tokens_in=0, tokens_out=0, embedding_tokens=0),
     )
     result.status = "completed"
     assert await job_module.finish_job(context, result) is False

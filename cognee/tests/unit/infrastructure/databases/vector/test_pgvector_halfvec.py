@@ -4,6 +4,7 @@ client-side Matryoshka cut in the OpenAI-compatible embedding engine."""
 import math
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import numpy as np
 import pytest
@@ -11,12 +12,12 @@ import pytest
 pytest.importorskip("asyncpg")
 pytest.importorskip("pgvector")
 
-from sqlalchemy.dialects import postgresql  # noqa: E402
+from sqlalchemy.dialects import postgresql
 
-from cognee.infrastructure.databases.vector.embeddings.OpenAICompatibleEmbeddingEngine import (  # noqa: E402
+from cognee.infrastructure.databases.vector.embeddings.OpenAICompatibleEmbeddingEngine import (
     OpenAICompatibleEmbeddingEngine,
 )
-from cognee.infrastructure.databases.vector.pgvector.PGVectorAdapter import (  # noqa: E402
+from cognee.infrastructure.databases.vector.pgvector.PGVectorAdapter import (
     PGVectorAdapter,
 )
 
@@ -75,6 +76,12 @@ def test_index_name_stays_within_the_identifier_limit():
     [
         (15, ["SET LOCAL hnsw.ef_search = 100", "SET LOCAL hnsw.iterative_scan = strict_order"]),
         (500, ["SET LOCAL hnsw.ef_search = 500", "SET LOCAL hnsw.iterative_scan = strict_order"]),
+        # The edge of the bound: 1000 still uses the index, 1001 is already a wide request.
+        (
+            1000,
+            ["SET LOCAL hnsw.ef_search = 1000", "SET LOCAL hnsw.iterative_scan = strict_order"],
+        ),
+        (1001, ["SET LOCAL enable_indexscan = off"]),
         (508_000, ["SET LOCAL enable_indexscan = off"]),
     ],
 )
@@ -133,6 +140,53 @@ def test_vector_of_the_configured_width_is_untouched(monkeypatch):
     monkeypatch.setenv("EMBEDDING_TRUNCATE_TO_DIMENSIONS", "true")
     vector = [3.0, 4.0]
     assert _engine(2)._fit_to_dimensions(vector) == vector
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flag", ["true", None])
+async def test_embed_text_fits_a_wide_provider_vector(monkeypatch, flag):
+    """The cut is wired into ``embed_text`` on the provider reply, after v1.6.5's decoding.
+
+    Through the engine, not ``_fit_to_dimensions`` alone: a provider reply of 4096 floats
+    must reach the caller as 2048 normalised ones with the flag on, and unchanged without it.
+    """
+    monkeypatch.delenv("MOCK_EMBEDDING", raising=False)
+    # The constructor resolves a tokenizer for the model id from the HuggingFace hub; this
+    # test is about the vector, so keep it off the network.
+    monkeypatch.setattr(
+        OpenAICompatibleEmbeddingEngine,
+        "get_tokenizer",
+        lambda self: SimpleNamespace(count_tokens=len),
+    )
+    if flag is None:
+        monkeypatch.delenv("EMBEDDING_TRUNCATE_TO_DIMENSIONS", raising=False)
+    else:
+        monkeypatch.setenv("EMBEDDING_TRUNCATE_TO_DIMENSIONS", flag)
+    engine = OpenAICompatibleEmbeddingEngine(
+        model="test-model",
+        dimensions=2048,
+        max_completion_tokens=8191,
+        endpoint="http://localhost:8099",
+        api_key="test-key",
+    )
+    wide = list(np.linspace(0.1, 1.0, 4096))
+    item = MagicMock()
+    item.embedding = wide
+    response = MagicMock()
+    response.data = [item]
+    engine._client = MagicMock()
+    engine._client.embeddings.create = AsyncMock(return_value=response)
+
+    result = await engine.embed_text(["text"])
+
+    engine._client.embeddings.create.assert_awaited_once()
+    if flag is None:
+        assert result[0] == wide and len(result[0]) == 4096
+        return
+    prefix = np.asarray(wide[:2048])
+    assert len(result[0]) == 2048
+    assert abs(np.linalg.norm(result[0]) - 1) <= 1e-6
+    assert np.allclose(result[0], prefix / np.linalg.norm(prefix))
 
 
 def _index_name(ddl):

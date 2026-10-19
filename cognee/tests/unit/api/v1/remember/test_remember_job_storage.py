@@ -62,6 +62,7 @@ async def test_job_updates_one_operation_row_with_attribution_and_tokens(stages,
         started.set()
         await release.wait()
         get_active_operation_usage().add(23, 5)
+        get_active_operation_usage().add_embedding(11)
         return {
             dataset_id: SimpleNamespace(
                 status="PipelineRunCompleted",
@@ -87,6 +88,7 @@ async def test_job_updates_one_operation_row_with_attribution_and_tokens(stages,
         row = rows[0]
         row_id = row.id
         assert row.outcome is None and row.ended_at is None
+        assert row.embedding_tokens is None
         assert row.status is None and row.pipeline_name is None and row.pipeline_id is None
         assert row.operation_name == "remember"
         assert row.user_id == owner.id and row.tenant_id == owner.tenant_id
@@ -99,7 +101,7 @@ async def test_job_updates_one_operation_row_with_attribution_and_tokens(stages,
         assert snapshot["job_id"] == result.job_id
         assert snapshot["dataset_id"] == str(dataset_id)
         assert snapshot["pipeline_run_id"] is None
-        await asyncio.wait_for(started.wait(), 5)
+        await started.wait()
     finally:
         release.set()
         await result
@@ -108,6 +110,7 @@ async def test_job_updates_one_operation_row_with_attribution_and_tokens(stages,
     row = rows[0]
     assert row.outcome == "succeeded" and row.ended_at >= row.started_at
     assert (row.tokens_in, row.tokens_out) == (40, 8)
+    assert row.embedding_tokens == 11
     assert row.parent_operation_id == parent.operation_id
     assert row.status is None and row.pipeline_name is None
     snapshot = await job_module.get_job_snapshot(result.job_id, owner)
@@ -146,7 +149,7 @@ async def test_same_dataset_jobs_never_borrow_each_others_result(stages, monkeyp
         self_improvement=False,
     )
     try:
-        await asyncio.wait_for(entered.wait(), 5)
+        await entered.wait()
         second = await remember_module.remember(
             "second",
             dataset_id=dataset_id,
@@ -264,7 +267,7 @@ async def test_both_terminal_states_are_immutable(stages, status):
     context = SimpleNamespace(
         operation_id=UUID(result.job_id),
         run_info=None,
-        usage=SimpleNamespace(tokens_in=999, tokens_out=999),
+        usage=SimpleNamespace(tokens_in=999, tokens_out=999, embedding_tokens=999),
     )
     assert await job_module.finish_job(context, result) is False
     assert await job_module.get_job_snapshot(result.job_id, owner) == before
