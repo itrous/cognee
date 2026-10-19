@@ -82,6 +82,10 @@ SAMPLE_ARGUMENTS = {
     "status_code": 400,
     # GlinerInstallError: which install step failed (lock, metadata, installer, torch, ...).
     "step": "sample-step",
+    # RememberStageFailedError: which remember stage failed, and its scrubbed class and text.
+    "stage": "add",
+    "error_class": "SampleError",
+    "error_message": "sample failure",
     # EmbeddingDimensionMismatchError: the model that built a dataset vs the configured one.
     "stored_model": "sample-provider/old-model",
     "stored_dimensions": 384,
