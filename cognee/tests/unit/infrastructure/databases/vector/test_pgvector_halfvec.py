@@ -14,7 +14,7 @@ import pytest
 pytest.importorskip("asyncpg")
 pytest.importorskip("pgvector")
 
-from sqlalchemy import MetaData
+from sqlalchemy import Column, MetaData, String, Table
 from sqlalchemy.dialects import postgresql
 
 import cognee.infrastructure.databases.vector.pgvector.PGVectorAdapter as pg_module
@@ -217,10 +217,13 @@ def test_short_collection_name_keeps_the_readable_index_name():
 class _FakeQuery:
     """Stands in for the SQLAlchemy select: every builder step returns itself."""
 
+    ordered_by: list = []
+
     def where(self, *_args, **_kwargs):
         return self
 
-    def order_by(self, *_args, **_kwargs):
+    def order_by(self, *args, **_kwargs):
+        _FakeQuery.ordered_by = list(args)
         return self
 
     def limit(self, *_args, **_kwargs):
@@ -258,7 +261,7 @@ def _distances(*values):
     return [SimpleNamespace(id=str(uuid4()), payload=None, similarity=v) for v in values]
 
 
-def _search_adapter(monkeypatch, session):
+def _search_adapter(monkeypatch, session, dimensions=3):
     monkeypatch.setattr(pg_module, "select", lambda *_args, **_kwargs: _FakeQuery())
     distance = SimpleNamespace(label=lambda _name: "distance_col")
     table = SimpleNamespace(
@@ -270,6 +273,8 @@ def _search_adapter(monkeypatch, session):
     )
     adapter = _adapter()
     adapter.get_table = AsyncMock(return_value=table)
+    adapter.embedding_engine = SimpleNamespace(get_vector_size=lambda: dimensions)
+    adapter._pgvector_version = AsyncMock(return_value=(0, 8, 0))
 
     @asynccontextmanager
     async def get_async_session():
@@ -359,9 +364,9 @@ def _tuned(limit):
             3,
             None,
             [_distances(0.4)],
-            ["SELECT"],
+            [_EXACT, "SELECT"],
             [0.4],
-            id="index-flag-off-leaves-the-scan-alone",
+            id="index-flag-off-filtered-is-exact-under-the-default-index",
         ),
         pytest.param(
             True,
@@ -388,6 +393,7 @@ def _tuned(limit):
 async def test_filtered_search_uses_the_index_and_rechecks_only_a_short_answer(
     monkeypatch, hnsw, node_name, limit, count, row_sets, log, scores
 ):
+    monkeypatch.delenv("PGVECTOR_HALFVEC", raising=False)
     if hnsw:
         monkeypatch.setenv("PGVECTOR_HNSW_INDEX", "true")
     else:
@@ -403,6 +409,118 @@ async def test_filtered_search_uses_the_index_and_rechecks_only_a_short_answer(
     assert [result.score for result in results] == scores
     # Every queued row set was needed: nothing is fetched twice by accident or left unread.
     assert session.row_sets == []
+
+
+# --- the opt-in switches and the default index do not mix -----------------------------------
+
+
+def _set_flags(monkeypatch, halfvec, hnsw):
+    for name, value in (("PGVECTOR_HALFVEC", halfvec), ("PGVECTOR_HNSW_INDEX", hnsw)):
+        if value:
+            monkeypatch.setenv(name, "true")
+        else:
+            monkeypatch.delenv(name, raising=False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("halfvec", "hnsw", "log", "default_order"),
+    [
+        pytest.param(
+            False,
+            False,
+            ["SET LOCAL enable_seqscan = off", "SET LOCAL hnsw.ef_search = 40", "SELECT"],
+            True,
+            id="flags-off-orders-by-the-default-halfvec-cast",
+        ),
+        pytest.param(True, False, ["SELECT"], False, id="halfvec-alone-is-a-plain-exact-scan"),
+        pytest.param(True, True, [*_tuned(3), "SELECT"], False, id="both-flags-stay-on-the-column"),
+    ],
+)
+async def test_unfiltered_search_follows_the_column_the_flags_chose(
+    monkeypatch, halfvec, hnsw, log, default_order
+):
+    # 2048 dimensions is where the paths differ: the default index is a cast over vector(2048),
+    # which a halfvec(2048) column with an index on the column itself must not be ordered by.
+    _set_flags(monkeypatch, halfvec, hnsw)
+    session = _SearchSession(_distances(0.4))
+    adapter = _search_adapter(monkeypatch, session, dimensions=2048)
+    monkeypatch.setattr(pg_module, "_indexed_distance", lambda *_args: "default_index_order")
+
+    await adapter.search("Entity_name", query_vector=[0.1], limit=3)
+
+    assert session.log == log
+    assert _FakeQuery.ordered_by == ["default_index_order" if default_order else "similarity"]
+    assert adapter._pgvector_version.await_count == (0 if halfvec or hnsw else 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("halfvec", "hnsw", "own_index", "default_index"),
+    [
+        pytest.param(False, False, False, True, id="flags-off-builds-the-default-index"),
+        pytest.param(True, False, False, False, id="halfvec-alone-builds-no-index"),
+        pytest.param(False, True, True, False, id="index-flag-builds-only-its-own"),
+        pytest.param(True, True, True, False, id="both-flags-build-only-the-column-index"),
+    ],
+)
+async def test_a_collection_gets_exactly_the_index_its_flags_ask_for(
+    monkeypatch, halfvec, hnsw, own_index, default_index
+):
+    _set_flags(monkeypatch, halfvec, hnsw)
+    connection = SimpleNamespace(
+        run_sync=AsyncMock(), exec_driver_sql=AsyncMock(), execute=AsyncMock()
+    )
+    adapter = _adapter()
+    adapter.embedding_engine = SimpleNamespace(get_vector_size=lambda: 1536)
+    adapter.has_collection = AsyncMock(return_value=False)
+    adapter._pgvector_version = AsyncMock(return_value=(0, 8, 0))
+    adapter.VECTOR_DB_LOCK = asyncio.Lock()
+    adapter._metadata = MetaData()
+    adapter.engine = SimpleNamespace(dialect=postgresql.dialect(), begin=lambda: _Begin(connection))
+    collection = f"flags_{halfvec}_{hnsw}"
+
+    try:
+        await adapter.create_collection(collection)
+    finally:
+        registered = pg_module.Base.metadata.tables.get(collection)
+        if registered is not None:
+            pg_module.Base.metadata.remove(registered)
+
+    assert connection.exec_driver_sql.await_count == (1 if own_index else 0)
+    statements = [str(call.args[0]) for call in connection.execute.await_args_list]
+    assert [s for s in statements if s.startswith("CREATE EXTENSION")] != []
+    default = [s for s in statements if s.startswith("CREATE INDEX")]
+    assert default == (
+        [pg_module.hnsw_index_statement(collection, 1536, (0, 8, 0))] if default_index else []
+    )
+
+
+# --- a stored halfvec reads back as floats -----------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_retrieve_with_vector_reads_both_column_types():
+    # The driver returns numpy for vector and pgvector's HalfVector for halfvec; dataset routing
+    # copies these vectors, and HalfVector is not iterable.
+    from pgvector.utils import HalfVector
+
+    rows = [
+        SimpleNamespace(id=str(uuid4()), payload={"text": "a"}, vector=np.array([0.5, 1.5])),
+        SimpleNamespace(id=str(uuid4()), payload={"text": "b"}, vector=HalfVector([2.5, 3.5])),
+    ]
+    session = SimpleNamespace(
+        execute=AsyncMock(return_value=SimpleNamespace(all=lambda: rows)),
+    )
+    adapter = _adapter()
+    adapter.get_table = AsyncMock(
+        return_value=Table("Entity_name", MetaData(), Column("id", String, primary_key=True))
+    )
+    adapter.get_async_session = lambda: _Begin(session)
+
+    results = await adapter.retrieve("Entity_name", [row.id for row in rows], include_vector=True)
+
+    assert [result.payload["vector"] for result in results] == [[0.5, 1.5], [2.5, 3.5]]
 
 
 # --- a collection wider than pgvector can index is created without the index ------------------
@@ -443,7 +561,9 @@ async def test_wide_collection_is_created_without_an_index_pgvector_would_refuse
         monkeypatch.delenv("PGVECTOR_HALFVEC", raising=False)
     warning = MagicMock()
     monkeypatch.setattr(pg_module, "logger", MagicMock(warning=warning))
-    connection = SimpleNamespace(run_sync=AsyncMock(), exec_driver_sql=AsyncMock())
+    connection = SimpleNamespace(
+        run_sync=AsyncMock(), exec_driver_sql=AsyncMock(), execute=AsyncMock()
+    )
     adapter = _adapter()
     adapter.embedding_engine = SimpleNamespace(get_vector_size=lambda: size)
     adapter.has_collection = AsyncMock(return_value=False)

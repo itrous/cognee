@@ -123,6 +123,7 @@ async def insert_running_job(context: "OperationContext", result) -> None:
     """
     from cognee.modules.operations import get_operation_origin
     from cognee.modules.pipelines.models import PipelineRun
+    from cognee.modules.pipelines.operations.run_sessions import add_run_sessions
 
     snapshot = build_job_snapshot(result, context.operation_id)
     snapshot["status"] = JOB_RUNNING
@@ -147,14 +148,13 @@ async def insert_running_job(context: "OperationContext", result) -> None:
         tokens_out=None,
         embedding_tokens=None,
         origin=get_operation_origin(),
-        session_id=context.session_id,
         parent_operation_id=context.parent_operation_id,
         background=context.background,
     )
 
     db_engine = get_relational_engine()
     async with db_engine.get_async_session() as session:
-        session.add(row)
+        add_run_sessions(session, row, context.session_ids)
         await session.commit()
 
     context.run_info = run_info

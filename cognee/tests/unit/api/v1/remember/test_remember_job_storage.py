@@ -308,3 +308,19 @@ async def test_orphan_running_row_is_not_promoted_by_a_new_reader(stages):
     assert body["pipeline_run_id"] is None
     assert "error" not in body
     assert stages["calls"] == []
+
+
+async def test_running_job_row_keeps_the_sessions_of_its_operation(stages):
+    from cognee.api.v1.remember.remember import RememberResult
+    from cognee.modules.operations import OperationContext
+    from cognee.modules.pipelines.operations.run_sessions import get_run_session_ids
+
+    context = OperationContext(
+        "remember", user_id=_user().id, dataset_id=uuid4(), session_ids=["s2", "s1"]
+    )
+    result = RememberResult(
+        status="running", dataset_name="docs", dataset_id=str(context.dataset_id)
+    )
+    await job_module.insert_running_job(context, result)
+    (row,) = await _rows(str(context.operation_id))
+    assert await get_run_session_ids([row.id]) == {row.id: ["s1", "s2"]}

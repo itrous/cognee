@@ -1,7 +1,7 @@
 """Exception text never reaches a stored or served job snapshot unscrubbed (job status v1).
 
 A failed run inside the improve result carries the exception's repr in its ``payload``, and
-errors repeat per stage, per rerun pass, per memify run and per ingested item. The snapshot is
+errors repeat per stage, per memify run and per ingested item. The snapshot is
 scrubbed as a whole, at any depth, while the payload of a run that succeeded is user data and
 stays exactly as it was.
 """
@@ -78,7 +78,6 @@ def _improve_with_leaks() -> ImproveResult:
     text_stage = _stage("update_user_preferences", "completed", run=_completed_run(SUCCESS_TEXT))
     return ImproveResult(
         stages=[errored_stage, ok_stage, deep_stage, text_stage],
-        rerun_passes=[[_stage("persist_session_qa", "errored", error=LEAK, run=_errored_run())]],
         error=LEAK,
         memify_run={str(uuid4()): _errored_run()},
     )
@@ -99,8 +98,7 @@ def _assert_no_leak(snapshot: dict) -> None:
 
 def _runs(snapshot: dict) -> list[dict]:
     improve = snapshot["improve"]
-    passes = [improve["stages"], *improve["rerun_passes"]]
-    found = [stage["run"] for stage_list in passes for stage in stage_list if stage.get("run")]
+    found = [stage["run"] for stage in improve["stages"] if stage.get("run")]
     found.extend(improve["memify_run"].values())
     return found
 
@@ -114,9 +112,8 @@ def test_snapshot_scrubs_every_exception_text_at_any_depth():
     assert snapshot["improve_error"] and "[email]" in snapshot["improve_error"]
     assert improve["error"] and "[email]" in improve["error"]
     assert improve["stages"][0]["error"] and "[email]" in improve["stages"][0]["error"]
-    assert improve["rerun_passes"][0][0]["error"] != LEAK
     errored = [run for run in _runs(snapshot) if run["status"] == "PipelineRunErrored"]
-    assert len(errored) == 4  # stage, deep stage, rerun pass, memify run
+    assert len(errored) == 3  # stage, deep stage, memify run
     assert all("[email]" in run["payload"] for run in errored)
     deep = snapshot["improve"]["stages"][2]["run"]
     assert "[email]" in deep["data_ingestion_info"][0]["run_info"]["payload"]
