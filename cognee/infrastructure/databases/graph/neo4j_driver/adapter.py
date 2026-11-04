@@ -1997,10 +1997,13 @@ class Neo4jAdapter(GraphDBInterface):
                 logger.warning("No target IDs provided for ID-filtered graph retrieval.")
                 return [], []
 
-            query = """
-            MATCH ()-[r]-()
-            WHERE startNode(r).id IN $target_ids
-               OR endNode(r).id IN $target_ids
+            # Start from the target nodes (unique index seek on id) and expand, instead of
+            # scanning every relationship; DISTINCT r keeps a relationship whose both ends
+            # are targets from being returned twice.
+            query = f"""
+            MATCH (n:`{BASE_LABEL}`)
+            WHERE n.id IN $target_ids
+            MATCH (n)-[r]-(m)
             WITH DISTINCT r, startNode(r) AS a, endNode(r) AS b
             RETURN
                 properties(a) AS n_properties,
