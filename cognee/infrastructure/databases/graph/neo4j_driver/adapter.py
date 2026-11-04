@@ -2012,23 +2012,28 @@ class Neo4jAdapter(GraphDBInterface):
                 properties(r) AS properties
             """
 
-            result = await self.query(query, {"target_ids": target_ids})
-
             nodes_dict = {}
             edges = []
 
-            for record in result:
-                n_props = _strip_provenance(record["n_properties"])
-                m_props = _strip_provenance(record["m_properties"])
-                r_props = _strip_provenance(record["properties"])
-                r_type = record["type"]
+            # Read the rows one at a time instead of materializing the whole result: a node
+            # shows up in every incident edge's row, so it is stripped once, on first sight.
+            async with self.get_session() as session:
+                result = await session.run(query, parameters={"target_ids": target_ids})
+                async for record in result:
+                    n_props = record["n_properties"]
+                    m_props = record["m_properties"]
+                    r_props = _strip_provenance(record["properties"])
+                    n_id = n_props["id"]
+                    m_id = m_props["id"]
 
-                nodes_dict[n_props["id"]] = (n_props["id"], n_props)
-                nodes_dict[m_props["id"]] = (m_props["id"], m_props)
+                    if n_id not in nodes_dict:
+                        nodes_dict[n_id] = (n_id, _strip_provenance(n_props))
+                    if m_id not in nodes_dict:
+                        nodes_dict[m_id] = (m_id, _strip_provenance(m_props))
 
-                source_id = r_props.get("source_node_id", n_props["id"])
-                target_id = r_props.get("target_node_id", m_props["id"])
-                edges.append((source_id, target_id, r_type, r_props))
+                    source_id = r_props.get("source_node_id", n_id)
+                    target_id = r_props.get("target_node_id", m_id)
+                    edges.append((source_id, target_id, record["type"], r_props))
 
             retrieval_time = time.time() - start_time
             logger.info(
