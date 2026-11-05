@@ -1981,6 +1981,48 @@ class Neo4jAdapter(GraphDBInterface):
             logger.error(f"Error during neighborhood retrieval: {e!s}")
             raise
 
+    @deadlock_retry()
+    async def _read_id_filtered_rows(
+        self, query: str, target_ids: list[str]
+    ) -> tuple[dict[str, tuple[str, dict[str, Any]]], list[tuple[Any, Any, str, dict[str, Any]]]]:
+        """Run the ID-filtered projection query and fold its rows into nodes and edges.
+
+        Reads the rows one at a time instead of materializing the whole result: a node shows
+        up in every incident edge's row, so it is stripped once, on first sight. Mirrors
+        ``query()``'s retry, span and error logging, which a streamed read cannot reuse.
+        """
+        with new_span("cognee.db.graph.query") as otel_span:
+            otel_span.set_attribute(COGNEE_DB_SYSTEM, "neo4j")
+            otel_span.set_attribute(COGNEE_DB_QUERY, redact_secrets(query[:500]))
+
+            nodes_dict = {}
+            edges = []
+            try:
+                async with self.get_session() as session:
+                    result = await session.run(query, parameters={"target_ids": target_ids})
+                    async for record in result:
+                        n_props = record["n_properties"]
+                        m_props = record["m_properties"]
+                        r_props = _strip_provenance(record["properties"])
+                        n_id = n_props["id"]
+                        m_id = m_props["id"]
+
+                        if n_id not in nodes_dict:
+                            nodes_dict[n_id] = (n_id, _strip_provenance(n_props))
+                        if m_id not in nodes_dict:
+                            nodes_dict[m_id] = (m_id, _strip_provenance(m_props))
+
+                        source_id = r_props.get("source_node_id", n_id)
+                        target_id = r_props.get("target_node_id", m_id)
+                        edges.append((source_id, target_id, record["type"], r_props))
+            except Neo4jError as error:
+                otel_span.set_status(StatusCode.ERROR, str(error))
+                otel_span.record_exception(error)
+                logger.exception("Neo4j query error")
+                raise
+            otel_span.set_attribute(COGNEE_DB_ROW_COUNT, len(edges))
+            return nodes_dict, edges
+
     async def get_id_filtered_graph_data(self, target_ids: list[str]):
         """
         Retrieve graph data filtered by specific node IDs, including their direct neighbors
@@ -2012,28 +2054,7 @@ class Neo4jAdapter(GraphDBInterface):
                 properties(r) AS properties
             """
 
-            nodes_dict = {}
-            edges = []
-
-            # Read the rows one at a time instead of materializing the whole result: a node
-            # shows up in every incident edge's row, so it is stripped once, on first sight.
-            async with self.get_session() as session:
-                result = await session.run(query, parameters={"target_ids": target_ids})
-                async for record in result:
-                    n_props = record["n_properties"]
-                    m_props = record["m_properties"]
-                    r_props = _strip_provenance(record["properties"])
-                    n_id = n_props["id"]
-                    m_id = m_props["id"]
-
-                    if n_id not in nodes_dict:
-                        nodes_dict[n_id] = (n_id, _strip_provenance(n_props))
-                    if m_id not in nodes_dict:
-                        nodes_dict[m_id] = (m_id, _strip_provenance(m_props))
-
-                    source_id = r_props.get("source_node_id", n_id)
-                    target_id = r_props.get("target_node_id", m_id)
-                    edges.append((source_id, target_id, record["type"], r_props))
+            nodes_dict, edges = await self._read_id_filtered_rows(query, target_ids)
 
             retrieval_time = time.time() - start_time
             logger.info(
