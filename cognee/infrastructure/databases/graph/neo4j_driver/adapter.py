@@ -2001,7 +2001,7 @@ class Neo4jAdapter(GraphDBInterface):
             otel_span.set_attribute(COGNEE_DB_QUERY, redact_secrets(edges_query[:500]))
 
             edge_rows = []
-            endpoint_ids = {}
+            element_ids = {}
             props_by_id = {}
             try:
                 async with self.get_session() as session:
@@ -2018,11 +2018,11 @@ class Neo4jAdapter(GraphDBInterface):
                             edge_rows.append(
                                 (record["aid"], record["bid"], record["type"], r_props)
                             )
-                            endpoint_ids[record["aid"]] = None
-                            endpoint_ids[record["bid"]] = None
+                            element_ids[record["aeid"]] = None
+                            element_ids[record["beid"]] = None
 
                         result = await transaction.run(
-                            nodes_query, parameters={"ids": list(endpoint_ids)}
+                            nodes_query, parameters={"element_ids": list(element_ids)}
                         )
                         async for record in result:
                             props_by_id[record["id"]] = _strip_provenance(record["properties"])
@@ -2078,14 +2078,18 @@ class Neo4jAdapter(GraphDBInterface):
             MATCH (n)-[r]-(m)
             WITH DISTINCT r, startNode(r) AS a, endNode(r) AS b
             RETURN
+                elementId(a) AS aeid,
+                elementId(b) AS beid,
                 a.id AS aid,
                 b.id AS bid,
                 type(r) AS type,
                 properties(r) AS properties
             """
-            nodes_query = f"""
-            MATCH (n:`{BASE_LABEL}`)
-            WHERE n.id IN $ids
+            # By element id, not id: a neighbour may lack the base label, and an id lookup
+            # without a label scans every node, while the element id seeks directly.
+            nodes_query = """
+            MATCH (n)
+            WHERE elementId(n) IN $element_ids
             RETURN n.id AS id, properties(n) AS properties
             """
 
