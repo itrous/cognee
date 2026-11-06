@@ -1,6 +1,7 @@
 """Neo4j Adapter for Graph Database"""
 
 import asyncio
+import inspect
 import json
 from collections.abc import Coroutine
 from contextlib import asynccontextmanager, nullcontext
@@ -2003,24 +2004,30 @@ class Neo4jAdapter(GraphDBInterface):
             endpoint_ids = {}
             props_by_id = {}
             try:
-                async with (
-                    self.get_session() as session,
-                    await session.begin_transaction() as transaction,
-                ):
-                    result = await transaction.run(
-                        edges_query, parameters={"target_ids": target_ids}
-                    )
-                    async for record in result:
-                        r_props = _strip_provenance(record["properties"])
-                        edge_rows.append((record["aid"], record["bid"], record["type"], r_props))
-                        endpoint_ids[record["aid"]] = None
-                        endpoint_ids[record["bid"]] = None
+                async with self.get_session() as session:
+                    # Driver versions differ in whether begin_transaction() is a coroutine.
+                    transaction = session.begin_transaction()
+                    if inspect.isawaitable(transaction):
+                        transaction = await transaction
+                    try:
+                        result = await transaction.run(
+                            edges_query, parameters={"target_ids": target_ids}
+                        )
+                        async for record in result:
+                            r_props = _strip_provenance(record["properties"])
+                            edge_rows.append(
+                                (record["aid"], record["bid"], record["type"], r_props)
+                            )
+                            endpoint_ids[record["aid"]] = None
+                            endpoint_ids[record["bid"]] = None
 
-                    result = await transaction.run(
-                        nodes_query, parameters={"ids": list(endpoint_ids)}
-                    )
-                    async for record in result:
-                        props_by_id[record["id"]] = _strip_provenance(record["properties"])
+                        result = await transaction.run(
+                            nodes_query, parameters={"ids": list(endpoint_ids)}
+                        )
+                        async for record in result:
+                            props_by_id[record["id"]] = _strip_provenance(record["properties"])
+                    finally:
+                        await transaction.close()
             except Neo4jError as error:
                 otel_span.set_status(StatusCode.ERROR, str(error))
                 otel_span.record_exception(error)
