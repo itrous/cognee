@@ -1983,43 +1983,65 @@ class Neo4jAdapter(GraphDBInterface):
 
     @deadlock_retry()
     async def _read_id_filtered_rows(
-        self, query: str, target_ids: list[str]
+        self, edges_query: str, nodes_query: str, target_ids: list[str]
     ) -> tuple[dict[str, tuple[str, dict[str, Any]]], list[tuple[Any, Any, str, dict[str, Any]]]]:
-        """Run the ID-filtered projection query and fold its rows into nodes and edges.
+        """Read the ID-filtered projection: edges with endpoint ids, then node properties once.
 
-        Reads the rows one at a time instead of materializing the whole result: a node shows
-        up in every incident edge's row, so it is stripped once, on first sight. Mirrors
-        ``query()``'s retry, span and error logging, which a streamed read cannot reuse.
+        A node shows up in every incident edge's row, and a hub's properties can be hundreds
+        of kilobytes, so the edge rows carry only endpoint ids and the properties of the
+        unique endpoints come from a second query in the same transaction. Rows are streamed
+        and the properties stripped once per node. An edge whose endpoint the second query did
+        not return (deleted in between) is dropped, never given invented properties; the
+        projection skips such edges as well. Mirrors ``query()``'s retry, span and error
+        logging, which a streamed read cannot reuse.
         """
         with new_span("cognee.db.graph.query") as otel_span:
             otel_span.set_attribute(COGNEE_DB_SYSTEM, "neo4j")
-            otel_span.set_attribute(COGNEE_DB_QUERY, redact_secrets(query[:500]))
+            otel_span.set_attribute(COGNEE_DB_QUERY, redact_secrets(edges_query[:500]))
 
-            nodes_dict = {}
-            edges = []
+            edge_rows = []
+            endpoint_ids = {}
+            props_by_id = {}
             try:
-                async with self.get_session() as session:
-                    result = await session.run(query, parameters={"target_ids": target_ids})
+                async with (
+                    self.get_session() as session,
+                    await session.begin_transaction() as transaction,
+                ):
+                    result = await transaction.run(
+                        edges_query, parameters={"target_ids": target_ids}
+                    )
                     async for record in result:
-                        n_props = record["n_properties"]
-                        m_props = record["m_properties"]
                         r_props = _strip_provenance(record["properties"])
-                        n_id = n_props["id"]
-                        m_id = m_props["id"]
+                        edge_rows.append((record["aid"], record["bid"], record["type"], r_props))
+                        endpoint_ids[record["aid"]] = None
+                        endpoint_ids[record["bid"]] = None
 
-                        if n_id not in nodes_dict:
-                            nodes_dict[n_id] = (n_id, _strip_provenance(n_props))
-                        if m_id not in nodes_dict:
-                            nodes_dict[m_id] = (m_id, _strip_provenance(m_props))
-
-                        source_id = r_props.get("source_node_id", n_id)
-                        target_id = r_props.get("target_node_id", m_id)
-                        edges.append((source_id, target_id, record["type"], r_props))
+                    result = await transaction.run(
+                        nodes_query, parameters={"ids": list(endpoint_ids)}
+                    )
+                    async for record in result:
+                        props_by_id[record["id"]] = _strip_provenance(record["properties"])
             except Neo4jError as error:
                 otel_span.set_status(StatusCode.ERROR, str(error))
                 otel_span.record_exception(error)
                 logger.exception("Neo4j query error")
                 raise
+
+            nodes_dict = {}
+            edges = []
+            for aid, bid, relationship_type, r_props in edge_rows:
+                if aid not in props_by_id or bid not in props_by_id:
+                    continue
+                nodes_dict.setdefault(aid, (aid, props_by_id[aid]))
+                nodes_dict.setdefault(bid, (bid, props_by_id[bid]))
+                edges.append(
+                    (
+                        r_props.get("source_node_id", aid),
+                        r_props.get("target_node_id", bid),
+                        relationship_type,
+                        r_props,
+                    )
+                )
             otel_span.set_attribute(COGNEE_DB_ROW_COUNT, len(edges))
             return nodes_dict, edges
 
@@ -2028,7 +2050,8 @@ class Neo4jAdapter(GraphDBInterface):
         Retrieve graph data filtered by specific node IDs, including their direct neighbors
         and only edges where one endpoint matches those IDs.
 
-        This version uses a single Cypher query for efficiency.
+        Two queries in one transaction: the edges with their endpoint ids, then the
+        properties of the unique endpoints.
         """
         import time
 
@@ -2042,19 +2065,26 @@ class Neo4jAdapter(GraphDBInterface):
             # Start from the target nodes (unique index seek on id) and expand, instead of
             # scanning every relationship; DISTINCT r keeps a relationship whose both ends
             # are targets from being returned twice.
-            query = f"""
+            edges_query = f"""
             MATCH (n:`{BASE_LABEL}`)
             WHERE n.id IN $target_ids
             MATCH (n)-[r]-(m)
             WITH DISTINCT r, startNode(r) AS a, endNode(r) AS b
             RETURN
-                properties(a) AS n_properties,
-                properties(b) AS m_properties,
+                a.id AS aid,
+                b.id AS bid,
                 type(r) AS type,
                 properties(r) AS properties
             """
+            nodes_query = f"""
+            MATCH (n:`{BASE_LABEL}`)
+            WHERE n.id IN $ids
+            RETURN n.id AS id, properties(n) AS properties
+            """
 
-            nodes_dict, edges = await self._read_id_filtered_rows(query, target_ids)
+            nodes_dict, edges = await self._read_id_filtered_rows(
+                edges_query, nodes_query, target_ids
+            )
 
             retrieval_time = time.time() - start_time
             logger.info(
