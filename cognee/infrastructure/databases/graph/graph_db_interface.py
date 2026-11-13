@@ -13,8 +13,10 @@ from cognee.infrastructure.databases.graph.bounded_neighborhood import (
 )
 from cognee.infrastructure.databases.provenance import (
     EdgeDeleteData,
+    EdgeDeletePlanData,
     EdgeIdentity,
     NodeDeleteData,
+    NodeDeletePlanData,
 )
 from cognee.infrastructure.engine import DataPoint
 from cognee.shared.logging_utils import get_logger
@@ -426,6 +428,60 @@ class GraphDBInterface(ABC):
             - dict[EdgeIdentity, EdgeDeleteData]: Delete data keyed by edge identity.
         """
         raise UnsupportedProvenanceCapability()
+
+    async def get_node_delete_plan_data(self, node_ids: list[str]) -> dict[str, NodeDeletePlanData]:
+        """Return only planner inputs, retaining every ownership ref.
+
+        Backends can project these fields natively without transferring full
+        properties or run history. The generic implementation derives the same
+        planning contract from the existing full snapshot API.
+        """
+        snapshots = await self.get_node_delete_data(node_ids)
+        return {
+            node_id: NodeDeletePlanData(
+                node_id=data.node_id,
+                node_type=data.node_type,
+                indexed_fields=list(data.indexed_fields),
+                node_properties={"name": data.node_properties.get("name")},
+                source_ref_keys=list(data.source_ref_keys),
+            )
+            for node_id, data in snapshots.items()
+        }
+
+    async def get_edge_delete_plan_data(
+        self, edges: list[EdgeIdentity]
+    ) -> dict[EdgeIdentity, EdgeDeletePlanData]:
+        """Return edge planner inputs without changing the full snapshot API."""
+        snapshots = await self.get_edge_delete_data(edges)
+        return {
+            edge: EdgeDeletePlanData(
+                edge=data.edge,
+                edge_text=data.edge_text,
+                source_ref_keys=list(data.source_ref_keys),
+            )
+            for edge, data in snapshots.items()
+        }
+
+    async def get_existing_edge_texts(self, candidate_texts: list[str]) -> set[str]:
+        """Return candidate retrieval texts still used by any graph relationship.
+
+        The generic implementation uses the graph snapshot contract. Adapters
+        with native queries should check candidates without loading node data.
+        """
+        if not candidate_texts:
+            return set()
+        # Lazy import: the modules layer imports this interface during startup.
+        from cognee.modules.graph.utils.prepare_edges_for_storage import get_edge_retrieval_text
+
+        candidates = set(candidate_texts)
+        _, edges = await self.get_graph_data()
+        existing = set()
+        for edge in edges:
+            properties = edge[3] if len(edge) > 3 and isinstance(edge[3], dict) else {}
+            text = get_edge_retrieval_text(properties.get("edge_text"), edge[2])
+            if text and text in candidates:
+                existing.add(text)
+        return existing
 
     async def find_nodes_by_source_ref(
         self,

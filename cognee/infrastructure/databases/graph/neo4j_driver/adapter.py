@@ -20,8 +20,10 @@ from cognee.infrastructure.databases.graph.graph_db_interface import (
 )
 from cognee.infrastructure.databases.provenance import (
     EdgeDeleteData,
+    EdgeDeletePlanData,
     EdgeIdentity,
     NodeDeleteData,
+    NodeDeletePlanData,
     get_dataset_id_from_source_ref_key,
     get_pipeline_run_id_from_source_run_ref,
     get_source_ref_key_from_source_run_ref,
@@ -915,6 +917,93 @@ class Neo4jAdapter(GraphDBInterface):
                 source_run_refs=list(row["srr"]),
             )
         return result
+
+    async def get_node_delete_plan_data(self, node_ids: list[str]) -> dict[str, NodeDeletePlanData]:
+        """Project planner fields only: shared nodes can carry very large run history."""
+        if not node_ids:
+            return {}
+        rows = await self.query(
+            f"""
+            MATCH (n:`{BASE_LABEL}`) WHERE n.id IN $ids
+            RETURN n.id AS id, n.type AS node_type, n.metadata AS metadata, n.name AS name,
+                   coalesce(n.source_ref_keys, []) AS srk
+            """,
+            {"ids": list(node_ids)},
+        )
+        return {
+            row["id"]: NodeDeletePlanData(
+                node_id=row["id"],
+                node_type=row["node_type"] or "",
+                indexed_fields=self._indexed_fields_from_properties({"metadata": row["metadata"]}),
+                node_properties={"name": row["name"]},
+                source_ref_keys=list(row["srk"]),
+            )
+            for row in rows
+        }
+
+    async def get_edge_delete_plan_data(
+        self, edges: list[EdgeIdentity]
+    ) -> dict[EdgeIdentity, EdgeDeletePlanData]:
+        """Read complete ownership without transferring relationship properties/run refs."""
+        if not edges:
+            return {}
+        rows = await self.query(
+            f"""
+            UNWIND $edges AS e
+            MATCH (a:`{BASE_LABEL}`)-[r]->(b:`{BASE_LABEL}`)
+            WHERE a.id = e.s AND b.id = e.t AND type(r) = e.rel
+            RETURN a.id AS s, b.id AS t, type(r) AS rel, r.edge_text AS edge_text,
+                   coalesce(r.source_ref_keys, []) AS srk
+            """,
+            {"edges": [self._edge_identity_row(edge) for edge in edges]},
+        )
+        from cognee.modules.graph.utils.prepare_edges_for_storage import get_edge_retrieval_text
+
+        result = {}
+        for row in rows:
+            edge = EdgeIdentity(row["s"], row["t"], row["rel"])
+            result[edge] = EdgeDeletePlanData(
+                edge=edge,
+                edge_text=get_edge_retrieval_text(row["edge_text"], edge.relationship_name),
+                source_ref_keys=list(row["srk"]),
+            )
+        return result
+
+    async def get_existing_edge_texts(self, candidate_texts: list[str]) -> set[str]:
+        """Check candidate retrieval texts without exporting the graph or its properties."""
+        if not candidate_texts:
+            return set()
+        # Match Python str.strip(), including NBSP and the C0 separators that
+        # default Cypher trimming does not necessarily classify as whitespace.
+        strip_chars = (
+            "\t\n\v\f\r\x1c\x1d\x1e\x1f \x85\xa0\u1680"
+            "\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a"
+            "\u2028\u2029\u202f\u205f\u3000"
+        )
+        rows = await self.query(
+            f"""
+            MATCH (a:`{BASE_LABEL}`)-[r]->(b:`{BASE_LABEL}`)
+            WITH r, CASE WHEN r.edge_text IS :: STRING
+                         THEN btrim(r.edge_text, $strip_chars) ELSE null END AS stored_text,
+                    btrim(type(r), $strip_chars) AS rel_text
+            WHERE stored_text IN $texts
+               OR ((r.edge_text IS NULL OR stored_text = '') AND rel_text IN $texts)
+               OR (r.edge_text IS NOT NULL AND NOT (r.edge_text IS :: STRING))
+            RETURN DISTINCT r.edge_text AS edge_text, type(r) AS rel
+            """,
+            {"texts": list(candidate_texts), "strip_chars": strip_chars},
+        )
+        from cognee.modules.graph.utils.prepare_edges_for_storage import get_edge_retrieval_text
+
+        # Non-string legacy values are normalized by the same Python helper as
+        # full snapshots (Cypher toString differs for booleans and some numbers).
+        candidates = set(candidate_texts)
+        return {
+            text
+            for row in rows
+            if (text := get_edge_retrieval_text(row["edge_text"], row["rel"]))
+            and text in candidates
+        }
 
     async def find_nodes_by_source_ref(self, source_ref_key: str) -> list[str]:
         rows = await self.query(

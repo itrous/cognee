@@ -110,8 +110,8 @@ class UnifiedStoreEngine(GraphVectorStoreInterface):
         node_ids = await graph.find_nodes_by_source_ref(source_ref_key)
         edges = await graph.find_edges_by_source_ref(source_ref_key)
 
-        node_data = await graph.get_node_delete_data(node_ids)
-        edge_data = await graph.get_edge_delete_data(edges)
+        node_data = await graph.get_node_delete_plan_data(node_ids)
+        edge_data = await graph.get_edge_delete_plan_data(edges)
 
         refs_by_node = {node_id: [source_ref_key] for node_id in node_data}
         refs_by_edge = {edge: [source_ref_key] for edge in edge_data}
@@ -148,8 +148,8 @@ class UnifiedStoreEngine(GraphVectorStoreInterface):
             for edge in await graph.find_edges_by_source_ref(key):
                 refs_by_edge.setdefault(edge, []).append(key)
 
-        node_data = await graph.get_node_delete_data(list(refs_by_node.keys()))
-        edge_data = await graph.get_edge_delete_data(list(refs_by_edge.keys()))
+        node_data = await graph.get_node_delete_plan_data(list(refs_by_node.keys()))
+        edge_data = await graph.get_edge_delete_plan_data(list(refs_by_edge.keys()))
 
         return await execute_source_ref_removal(
             graph,
@@ -198,8 +198,8 @@ class UnifiedStoreEngine(GraphVectorStoreInterface):
             if (document_refs := _document_refs(refs))
         }
 
-        node_data = await graph.get_node_delete_data(list(refs_by_node.keys()))
-        edge_data = await graph.get_edge_delete_data(list(refs_by_edge.keys()))
+        node_data = await graph.get_node_delete_plan_data(list(refs_by_node.keys()))
+        edge_data = await graph.get_edge_delete_plan_data(list(refs_by_edge.keys()))
 
         return await execute_source_ref_removal(
             graph,
@@ -220,8 +220,8 @@ class UnifiedStoreEngine(GraphVectorStoreInterface):
         refs_by_node = await graph.find_node_source_refs_by_dataset(dataset_id)
         refs_by_edge = await graph.find_edge_source_refs_by_dataset(dataset_id)
 
-        node_data = await graph.get_node_delete_data(list(refs_by_node.keys()))
-        edge_data = await graph.get_edge_delete_data(list(refs_by_edge.keys()))
+        node_data = await graph.get_node_delete_plan_data(list(refs_by_node.keys()))
+        edge_data = await graph.get_edge_delete_plan_data(list(refs_by_edge.keys()))
 
         await execute_source_ref_removal(
             graph,
@@ -251,8 +251,8 @@ class UnifiedStoreEngine(GraphVectorStoreInterface):
             refs_by_node = _without_kept_refs(refs_by_node, keep_data_ids)
             refs_by_edge = _without_kept_refs(refs_by_edge, keep_data_ids)
 
-        node_data = await graph.get_node_delete_data(list(refs_by_node.keys()))
-        edge_data = await graph.get_edge_delete_data(list(refs_by_edge.keys()))
+        node_data = await graph.get_node_delete_plan_data(list(refs_by_node.keys()))
+        edge_data = await graph.get_edge_delete_plan_data(list(refs_by_edge.keys()))
 
         await execute_source_ref_removal(
             graph,

@@ -6,7 +6,13 @@ from .constants import (
     SOURCE_REF_PREFIX,
     SOURCE_RUN_REF_PREFIX,
 )
-from .delete_data import EdgeDeleteData, EdgeIdentity, NodeDeleteData
+from .delete_data import (
+    EdgeDeleteData,
+    EdgeDeletePlanData,
+    EdgeIdentity,
+    NodeDeleteData,
+    NodeDeletePlanData,
+)
 from .source_refs import (
     get_data_id_from_source_ref_key,
     get_dataset_id_from_source_ref_key,
@@ -32,8 +38,10 @@ __all__ = [
     "SOURCE_REF_PREFIX",
     "SOURCE_RUN_REF_PREFIX",
     "EdgeDeleteData",
+    "EdgeDeletePlanData",
     "EdgeIdentity",
     "NodeDeleteData",
+    "NodeDeletePlanData",
     "ParsedSourceRef",
     "data_item_id",
     "get_data_id_from_source_ref_key",

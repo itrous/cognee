@@ -20,11 +20,13 @@ spec:
 - no-candidate no-op.
 """
 
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
 
 from cognee.infrastructure.databases.exceptions import UnsupportedProvenanceCapability
+from cognee.infrastructure.databases.graph.graph_db_interface import GraphDBInterface
 from cognee.infrastructure.databases.provenance import (
     EdgeDeleteData,
     EdgeIdentity,
@@ -104,6 +106,10 @@ class FakeVectorEngine:
 
 class FakeProvenanceGraphEngine:
     """In-memory graph implementing Lazar's Part 0 provenance methods."""
+
+    get_node_delete_plan_data = GraphDBInterface.get_node_delete_plan_data
+    get_edge_delete_plan_data = GraphDBInterface.get_edge_delete_plan_data
+    get_existing_edge_texts = GraphDBInterface.get_existing_edge_texts
 
     def __init__(self, supports_provenance: bool = True):
         self._supports = supports_provenance
@@ -685,6 +691,59 @@ async def test_fake_dataset_helper_matches_contract():
     ref = make_source_ref_key(dataset, uuid4())
     assert _dataset_of(ref) == str(dataset)
     assert str(get_dataset_id_from_source_ref_key(ref)) == _dataset_of(ref)
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "delete_by_source_ref",
+        "delete_by_source_refs",
+        "delete_by_document",
+        "delete_by_dataset_id",
+        "rollback_by_pipeline_run_id",
+    ],
+)
+async def test_all_removal_routes_request_planning_snapshots(operation):
+    """Optimized adapters must not be forced back through full snapshot reads."""
+    dataset, data_id, run = uuid4(), uuid4(), uuid4()
+    ref = make_source_ref_key(dataset, data_id)
+    graph = FakeProvenanceGraphEngine()
+    graph.get_node_delete_plan_data = AsyncMock(return_value={})
+    graph.get_edge_delete_plan_data = AsyncMock(return_value={})
+    graph.get_node_delete_data = AsyncMock(side_effect=AssertionError("full node read"))
+    graph.get_edge_delete_data = AsyncMock(side_effect=AssertionError("full edge read"))
+    engine = _build_engine(graph, FakeVectorEngine())
+    args = {
+        "delete_by_source_ref": (ref,),
+        "delete_by_source_refs": ([ref],),
+        "delete_by_document": (str(dataset), str(data_id)),
+        "delete_by_dataset_id": (str(dataset),),
+        "rollback_by_pipeline_run_id": (str(run),),
+    }
+    await getattr(engine, operation)(*args[operation])
+    graph.get_node_delete_plan_data.assert_awaited_once_with([])
+    graph.get_edge_delete_plan_data.assert_awaited_once_with([])
+    graph.get_node_delete_data.assert_not_awaited()
+    graph.get_edge_delete_data.assert_not_awaited()
+
+
+async def test_orphan_cleanup_checks_candidates_without_loading_graph():
+    ref = make_source_ref_key(uuid4(), uuid4())
+    graph = FakeProvenanceGraphEngine()
+    graph.add_node("a", "Entity", [], {})
+    graph.add_node("b", "Entity", [], {})
+    shared = graph.add_edge("a", "b", "shared", " shared text ")
+    orphaned = graph.add_edge("a", "b", "orphaned", "orphan text")
+    await graph.attach_edge_source_refs([shared, orphaned], [ref])
+    graph.get_existing_edge_texts = AsyncMock(return_value={"shared text"})
+    graph.get_graph_data = AsyncMock(side_effect=AssertionError("whole graph read"))
+    vector = FakeVectorEngine()
+
+    await _build_engine(graph, vector).delete_by_source_ref(ref)
+
+    graph.get_existing_edge_texts.assert_awaited_once_with(["orphan text", "shared text"])
+    graph.get_graph_data.assert_not_awaited()
+    assert vector.deleted == [("EdgeType_relationship_name", [str(EdgeType.id_for("orphan text"))])]
 
 
 # Reference the imports used only inside helpers so linters keep them.

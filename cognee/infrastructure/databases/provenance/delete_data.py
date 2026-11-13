@@ -12,6 +12,26 @@ class EdgeIdentity:
 
 
 @dataclass(frozen=True)
+class NodeDeletePlanData:
+    """Minimal delete-planning snapshot; ownership refs are complete, never sampled."""
+
+    node_id: str
+    node_type: str
+    indexed_fields: list[str]
+    node_properties: dict[str, Any]
+    source_ref_keys: list[str]
+
+
+@dataclass(frozen=True)
+class EdgeDeletePlanData:
+    """Edge identity, retrieval text, and complete ownership for delete planning."""
+
+    edge: EdgeIdentity
+    edge_text: str
+    source_ref_keys: list[str]
+
+
+@dataclass(frozen=True)
 class NodeDeleteData:
     """
     Node payload needed to decide and perform graph-provenance delete or vector cleanup.

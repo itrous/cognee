@@ -27,9 +27,9 @@ import dataclasses
 from dataclasses import dataclass
 
 from cognee.infrastructure.databases.provenance import (
-    EdgeDeleteData,
+    EdgeDeletePlanData,
     EdgeIdentity,
-    NodeDeleteData,
+    NodeDeletePlanData,
 )
 from cognee.modules.engine.utils import generate_node_id
 from cognee.modules.graph.models.EdgeType import EdgeType
@@ -74,8 +74,8 @@ async def execute_source_ref_removal(
     graph_engine,
     vector_engine,
     *,
-    node_data: dict[str, NodeDeleteData],
-    edge_data: dict[EdgeIdentity, EdgeDeleteData],
+    node_data: dict[str, NodeDeletePlanData],
+    edge_data: dict[EdgeIdentity, EdgeDeletePlanData],
     refs_by_node: dict[str, list[str]],
     refs_by_edge: dict[EdgeIdentity, list[str]],
 ) -> SourceRefRemovalResult:
@@ -180,7 +180,7 @@ async def _cleanup_orphaned_edge_types(
     graph_engine,
     vector_engine,
     unowned_edges: list[EdgeIdentity],
-    edge_data: dict[EdgeIdentity, EdgeDeleteData],
+    edge_data: dict[EdgeIdentity, EdgeDeletePlanData],
 ) -> None:
     """Prune EdgeType nodes (and their vectors) whose text no longer appears.
 
@@ -203,13 +203,9 @@ async def _cleanup_orphaned_edge_types(
         return
 
     try:
-        _, remaining_edges = await graph_engine.get_graph_data()
-        remaining_edge_texts: set[str] = set()
-        for edge in remaining_edges:
-            properties = edge[3] if len(edge) > 3 and isinstance(edge[3], dict) else {}
-            edge_text = get_edge_retrieval_text(properties.get("edge_text"), edge[2])
-            if edge_text:
-                remaining_edge_texts.add(edge_text)
+        remaining_edge_texts = await graph_engine.get_existing_edge_texts(
+            sorted(deleted_edge_texts)
+        )
 
         orphaned_edge_texts = [
             edge_text for edge_text in deleted_edge_texts if edge_text not in remaining_edge_texts
@@ -238,7 +234,7 @@ async def _cleanup_orphaned_nodeset_tags(
     graph_engine,
     vector_engine,
     unowned_node_ids: list[str],
-    node_data: dict[str, NodeDeleteData],
+    node_data: dict[str, NodeDeletePlanData],
 ) -> None:
     """Strip NodeSet tags belonging to deleted NodeSet nodes from surviving rows."""
     removed_nodeset_tags: set[str] = set()
