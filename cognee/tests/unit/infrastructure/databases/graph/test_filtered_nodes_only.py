@@ -37,6 +37,7 @@ async def test_cypher_adapters_skip_edge_queries(module_name, class_name, row):
     module = importlib.import_module(f"cognee.infrastructure.databases.graph.{module_name}.adapter")
     adapter = object.__new__(getattr(module, class_name))
     adapter.query = AsyncMock(return_value=[row])
+    adapter._query_retryable = adapter.query  # Neo4j reads go through the retrying entrypoint
     nodes, edges = await adapter.get_filtered_graph_data(
         [{"type": ["FactConflict"]}], include_edges=False
     )

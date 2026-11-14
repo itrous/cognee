@@ -95,79 +95,98 @@ async def execute_source_ref_removal(
         if _is_unowned(data.source_ref_keys, removed):
             unowned_edges.append(edge)
 
-    # ------------------------------------------------------------------
-    # 2. Delete vectors for unowned artifacts (from snapshots only).
-    # ------------------------------------------------------------------
-    node_vector_collections: dict[str, list[str]] = {}
-    for node_id in unowned_node_ids:
-        data = node_data[node_id]
-        for field in data.indexed_fields:
-            collection_name = f"{data.node_type}_{field}"
-            node_vector_collections.setdefault(collection_name, []).append(node_id)
+    # Imported here: cognee.tasks.storage imports this package at module level.
+    from cognee.tasks.storage.edge_type_lifecycle import edge_type_lifecycle
 
-    for collection, ids in node_vector_collections.items():
-        await _delete_vector_points(vector_engine, collection, ids)
+    # EdgeType vectors are keyed by shared text. On Neo4j + PGVector the lifecycle
+    # snapshots the texts of the unowned edges and of every edge incident to the
+    # unowned nodes before anything is deleted, and drops only the ids no live
+    # edge produces once the block succeeded. Other backends keep the
+    # best-effort cleanup below.
+    async with edge_type_lifecycle(
+        graph_engine,
+        vector_engine,
+        edge_identities=unowned_edges,
+        node_ids=unowned_node_ids,
+    ) as lifecycle:
+        # ------------------------------------------------------------------
+        # 2. Delete vectors for unowned artifacts (from snapshots only).
+        # ------------------------------------------------------------------
+        node_vector_collections: dict[str, list[str]] = {}
+        for node_id in unowned_node_ids:
+            data = node_data[node_id]
+            for field in data.indexed_fields:
+                collection_name = f"{data.node_type}_{field}"
+                node_vector_collections.setdefault(collection_name, []).append(node_id)
 
-    if unowned_edges:
-        # Per-edge triplet vectors are tied to a single deleted edge instance, so
-        # they are safe to delete here. EdgeType vectors are keyed by *shared*
-        # relationship text and may still be used by a surviving edge, so they
-        # are handled in _cleanup_orphaned_edge_types (after the graph delete,
-        # against the truly-orphaned text set) — never blindly here.
-        triplet_ids: list[str] = [
-            str(generate_node_id(edge.source_id + edge.relationship_name + edge.target_id))
-            for edge in unowned_edges
-        ]
-        if triplet_ids:
-            await _delete_vector_points(vector_engine, "Triplet_text", triplet_ids)
+        for collection, ids in node_vector_collections.items():
+            await _delete_vector_points(vector_engine, collection, ids)
 
-    # ------------------------------------------------------------------
-    # 3. Remove the targeted refs from SURVIVING artifacts only (idempotent).
-    #    Unowned artifacts keep their refs until they are hard-deleted below, so
-    #    a failed hard delete leaves them rediscoverable by source ref on retry
-    #    (Part 0 retry-safe order: delete unowned without first stripping refs).
-    # ------------------------------------------------------------------
-    unowned_node_set = set(unowned_node_ids)
-    nodes_by_removed_refs: dict[tuple[str, ...], list[str]] = {}
-    for node_id in node_data:
-        if node_id in unowned_node_set:
-            continue
-        removed = refs_by_node.get(node_id, [])
-        if not removed:
-            continue
-        nodes_by_removed_refs.setdefault(tuple(removed), []).append(node_id)
+        if unowned_edges:
+            # Per-edge triplet vectors are tied to a single deleted edge instance, so
+            # they are safe to delete here. EdgeType vectors are keyed by *shared*
+            # relationship text and may still be used by a surviving edge, so they
+            # are handled in _cleanup_orphaned_edge_types (after the graph delete,
+            # against the truly-orphaned text set) — never blindly here.
+            triplet_ids: list[str] = [
+                str(generate_node_id(edge.source_id + edge.relationship_name + edge.target_id))
+                for edge in unowned_edges
+            ]
+            if triplet_ids:
+                await _delete_vector_points(vector_engine, "Triplet_text", triplet_ids)
 
-    for removed_refs, node_ids in nodes_by_removed_refs.items():
-        await graph_engine.remove_node_source_refs(node_ids, list(removed_refs))
+        # ------------------------------------------------------------------
+        # 3. Remove the targeted refs from SURVIVING artifacts only (idempotent).
+        #    Unowned artifacts keep their refs until they are hard-deleted below, so
+        #    a failed hard delete leaves them rediscoverable by source ref on retry
+        #    (Part 0 retry-safe order: delete unowned without first stripping refs).
+        # ------------------------------------------------------------------
+        unowned_node_set = set(unowned_node_ids)
+        nodes_by_removed_refs: dict[tuple[str, ...], list[str]] = {}
+        for node_id in node_data:
+            if node_id in unowned_node_set:
+                continue
+            removed = refs_by_node.get(node_id, [])
+            if not removed:
+                continue
+            nodes_by_removed_refs.setdefault(tuple(removed), []).append(node_id)
 
-    unowned_edge_set = set(unowned_edges)
-    edges_by_removed_refs: dict[tuple[str, ...], list[EdgeIdentity]] = {}
-    for edge in edge_data:
-        if edge in unowned_edge_set:
-            continue
-        removed = refs_by_edge.get(edge, [])
-        if not removed:
-            continue
-        edges_by_removed_refs.setdefault(tuple(removed), []).append(edge)
+        for removed_refs, node_ids in nodes_by_removed_refs.items():
+            await graph_engine.remove_node_source_refs(node_ids, list(removed_refs))
 
-    for removed_refs, edges in edges_by_removed_refs.items():
-        await graph_engine.remove_edge_source_refs(edges, list(removed_refs))
+        unowned_edge_set = set(unowned_edges)
+        edges_by_removed_refs: dict[tuple[str, ...], list[EdgeIdentity]] = {}
+        for edge in edge_data:
+            if edge in unowned_edge_set:
+                continue
+            removed = refs_by_edge.get(edge, [])
+            if not removed:
+                continue
+            edges_by_removed_refs.setdefault(tuple(removed), []).append(edge)
 
-    # ------------------------------------------------------------------
-    # 4. Hard-delete unowned artifacts.
-    # ------------------------------------------------------------------
-    if unowned_node_ids:
-        await graph_engine.delete_nodes(unowned_node_ids)
+        for removed_refs, edges in edges_by_removed_refs.items():
+            await graph_engine.remove_edge_source_refs(edges, list(removed_refs))
 
-    if unowned_edges:
-        await graph_engine.delete_edge_triples(unowned_edges)
+        # ------------------------------------------------------------------
+        # 4. Hard-delete unowned artifacts.
+        # ------------------------------------------------------------------
+        if unowned_node_ids:
+            await graph_engine.delete_nodes(unowned_node_ids)
 
-    # ------------------------------------------------------------------
-    # 5. Post-delete cleanup parity with delete_from_graph_and_vector
-    #    (best-effort, non-fatal).
-    # ------------------------------------------------------------------
-    await _cleanup_orphaned_edge_types(graph_engine, vector_engine, unowned_edges, edge_data)
-    await _cleanup_orphaned_nodeset_tags(graph_engine, vector_engine, unowned_node_ids, node_data)
+        if unowned_edges:
+            await graph_engine.delete_edge_triples(unowned_edges)
+
+        # ------------------------------------------------------------------
+        # 5. Post-delete cleanup parity with delete_from_graph_and_vector
+        #    (best-effort, non-fatal).
+        # ------------------------------------------------------------------
+        if lifecycle is None:
+            await _cleanup_orphaned_edge_types(
+                graph_engine, vector_engine, unowned_edges, edge_data
+            )
+        await _cleanup_orphaned_nodeset_tags(
+            graph_engine, vector_engine, unowned_node_ids, node_data
+        )
 
     return SourceRefRemovalResult(
         deleted_node_ids=list(unowned_node_ids),

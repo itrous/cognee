@@ -116,3 +116,110 @@ async def test_index_graph_edges_initialization_error():
         pytest.raises(RuntimeError, match="Graph edge indexing error"),
     ):
         await index_graph_edges()
+
+
+def test_normalized_edge_type_batch():
+    """Spellings with one EdgeType id are one datapoint: first text kept, counts summed.
+
+    A raw-text Counter would emit two datapoints with the same id, and the second
+    write would replace the first's payload text.
+    """
+    from cognee.modules.graph.models.EdgeType import EdgeType
+
+    edges = [
+        ("a", "b", "works", {"edge_text": "Alice Works"}),
+        ("c", "d", "works", {"edge_text": "alice_works"}),
+        ("e", "f", "works", {"edge_text": "Alice Works"}),
+        ("g", "h", "lives_in", {"edge_text": "Bob lives in Oslo"}),
+    ]
+
+    datapoints = create_edge_type_datapoints(edges)
+
+    assert [(dp.relationship_name, dp.number_of_edges) for dp in datapoints] == [
+        ("Alice Works", 3),
+        ("Bob lives in Oslo", 1),
+    ]
+    assert len({dp.id for dp in datapoints}) == 2
+    assert datapoints[0].id == EdgeType.id_for("alice_works")
+
+
+@pytest.mark.asyncio
+async def test_full_graph_index_reads_edges_inside_the_lifecycle(monkeypatch):
+    import sys
+
+    pytest.importorskip("neo4j")
+    pytest.importorskip("asyncpg")
+    from cognee.infrastructure.databases.graph.neo4j_driver.adapter import Neo4jAdapter
+    from cognee.infrastructure.databases.vector.pgvector.PGVectorAdapter import PGVectorAdapter
+
+    calls = []
+    lifecycle_module = sys.modules["cognee.tasks.storage.edge_type_lifecycle"]
+
+    class _RecordedLock:
+        def __init__(self, vector_adapter):
+            pass
+
+        async def acquire(self):
+            calls.append("lock")
+
+        async def ensure_held(self):
+            pass
+
+        async def release(self):
+            calls.append("unlock")
+
+    monkeypatch.setattr(lifecycle_module, "_AdvisoryLock", _RecordedLock)
+    graph = AsyncMock(spec=Neo4jAdapter)
+
+    async def graph_data():
+        calls.append("read_graph")
+        return [], [("a", "b", "r", {"edge_text": "a r b"})]
+
+    graph.get_graph_data = AsyncMock(side_effect=graph_data)
+    vector = MagicMock(spec=PGVectorAdapter)
+    index = AsyncMock(side_effect=lambda *a, **k: calls.append("index"))
+
+    with patch.dict(
+        index_graph_edges.__globals__,
+        {
+            "get_graph_engine": AsyncMock(return_value=graph),
+            "get_vector_engine_async": AsyncMock(return_value=vector),
+            "index_data_points": index,
+        },
+    ):
+        await index_graph_edges()
+
+    assert calls == ["lock", "read_graph", "index", "unlock"]
+    assert index.await_args.kwargs["vector_engine"] is vector
+
+
+@pytest.mark.asyncio
+async def test_empty_batch_takes_no_lifecycle_lock(monkeypatch):
+    import sys
+
+    pytest.importorskip("neo4j")
+    pytest.importorskip("asyncpg")
+    from cognee.infrastructure.databases.graph.neo4j_driver.adapter import Neo4jAdapter
+    from cognee.infrastructure.databases.vector.pgvector.PGVectorAdapter import PGVectorAdapter
+
+    lifecycle_module = sys.modules["cognee.tasks.storage.edge_type_lifecycle"]
+
+    class _UnreachablePostgres:
+        def __init__(self, vector_adapter):
+            pass
+
+        async def acquire(self):
+            raise ConnectionError("PostgreSQL is down")
+
+    monkeypatch.setattr(lifecycle_module, "_AdvisoryLock", _UnreachablePostgres)
+    index = AsyncMock()
+
+    with patch.dict(index_graph_edges.__globals__, {"index_data_points": index}):
+        await index_graph_edges(
+            [],
+            vector_engine=MagicMock(spec=PGVectorAdapter),
+            graph_engine=AsyncMock(spec=Neo4jAdapter),
+        )
+
+    index.assert_awaited_once()
+    assert index.await_args.args[0] == []

@@ -284,16 +284,24 @@ async def _sweep_stale_code_docs(
     }
 
     stale = sorted(stale_documents) + sorted(stale_chunks) + sorted(stale_summaries)
-    for start in range(0, len(stale), _SWEEP_CHUNK_SIZE):
-        await graph_engine.delete_nodes(stale[start : start + _SWEEP_CHUNK_SIZE])
-    await _delete_vectors(
-        {
-            CodeDocument.vector_collection("name"): sorted(stale_documents),
-            DocumentChunk.vector_collection("text"): sorted(stale_chunks),
-            TextSummary.vector_collection("text"): sorted(stale_summaries),
-        }
-    )
     if stale:
+        from cognee.infrastructure.databases.vector import get_vector_engine_async
+        from cognee.tasks.storage.edge_type_lifecycle import edge_type_lifecycle
+
+        vector_engine = await get_vector_engine_async()
+        # Detach-delete takes the describes / is_part_of / made_from edges along;
+        # on Neo4j + PGVector their texts are EdgeType lifecycle candidates.
+        async with edge_type_lifecycle(graph_engine, vector_engine, node_ids=stale):
+            for start in range(0, len(stale), _SWEEP_CHUNK_SIZE):
+                await graph_engine.delete_nodes(stale[start : start + _SWEEP_CHUNK_SIZE])
+            await _delete_vectors(
+                vector_engine,
+                {
+                    CodeDocument.vector_collection("name"): sorted(stale_documents),
+                    DocumentChunk.vector_collection("text"): sorted(stale_chunks),
+                    TextSummary.vector_collection("text"): sorted(stale_summaries),
+                },
+            )
         logger.info(
             "Swept %d stale code document(s), %d chunk(s) and %d summary(ies).",
             len(stale_documents),
@@ -303,7 +311,7 @@ async def _sweep_stale_code_docs(
     return len(stale_documents), len(stale_chunks), len(stale_summaries)
 
 
-async def _delete_vectors(stale_by_collection: dict[str, list[str]]) -> None:
+async def _delete_vectors(vector_engine, stale_by_collection: dict[str, list[str]]) -> None:
     """Drop the swept nodes' embeddings from the collections add_data_points indexed them into.
 
     Deleting the graph node alone would leave its vector behind, and the chunk
@@ -315,12 +323,9 @@ async def _delete_vectors(stale_by_collection: dict[str, list[str]]) -> None:
     its node is served forever. A collection that was never written (a
     graph_only run) is skipped.
     """
-    from cognee.infrastructure.databases.vector import get_vector_engine_async
-
     stale_by_collection = {name: ids for name, ids in stale_by_collection.items() if ids}
     if not stale_by_collection:
         return
-    vector_engine = await get_vector_engine_async()
     for collection, ids in stale_by_collection.items():
         if not await vector_engine.has_collection(collection):
             continue

@@ -143,7 +143,9 @@ async def test_cognify_passes_the_argument_to_get_default_tasks(
 ):
     mock_executor.return_value = AsyncMock(return_value={})
 
-    await cognify_module.cognify(early_chunk_indexing=False)
+    # Pinned: with no LLM key in the environment "auto" resolves to gliner_demo,
+    # which never calls get_default_tasks.
+    await cognify_module.cognify(early_chunk_indexing=False, extractor="llm")
 
     assert mock_get_default_tasks.await_args.kwargs["early_chunk_indexing"] is False
 

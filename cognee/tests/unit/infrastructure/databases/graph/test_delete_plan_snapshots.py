@@ -23,6 +23,8 @@ def adapter():
 
     instance = Neo4jAdapter("bolt://unused", graph_database_allow_anonymous=True, driver=object())
     instance.query = AsyncMock(return_value=[])
+    # Planner reads go through the connection-retrying entrypoint; one mock records both.
+    instance._query_retryable = instance.query
     return instance
 
 

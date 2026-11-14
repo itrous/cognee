@@ -11,6 +11,7 @@ from cognee.infrastructure.databases.unified import get_unified_engine
 from cognee.infrastructure.databases.vector.exceptions import CollectionNotFoundError
 from cognee.modules.pipelines.models import PipelineContext
 from cognee.tasks.storage import add_data_points
+from cognee.tasks.storage.edge_type_lifecycle import edge_type_lifecycle
 from cognee.tasks.summarization.models import GlobalContextSummary
 
 from .constants import GLOBAL_CONTEXT_SUMMARY_COLLECTION
@@ -33,8 +34,13 @@ async def safe_delete_context_vectors(vector_engine: Any, ids: list[str]) -> Non
 async def delete_context_index_nodes(unified_engine: Any, bucket_ids: list[str]) -> None:
     if not bucket_ids:
         return
-    await unified_engine.graph.delete_nodes(bucket_ids)
-    await safe_delete_context_vectors(unified_engine.vector, bucket_ids)
+    # Detach-delete takes the buckets' and root's edges along; on Neo4j + PGVector
+    # their texts are EdgeType lifecycle candidates snapshotted before the delete.
+    async with edge_type_lifecycle(
+        unified_engine.graph, unified_engine.vector, node_ids=bucket_ids
+    ):
+        await unified_engine.graph.delete_nodes(bucket_ids)
+        await safe_delete_context_vectors(unified_engine.vector, bucket_ids)
 
 
 def ensure_global_context_storage_context(

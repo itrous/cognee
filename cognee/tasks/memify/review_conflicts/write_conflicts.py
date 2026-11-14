@@ -25,6 +25,7 @@ from cognee.modules.graph.utils.fact_conflicts import (
     read_conflict_marks,
 )
 from cognee.tasks.storage import add_data_points
+from cognee.tasks.storage.edge_type_lifecycle import edge_type_lifecycle
 
 from .accept_review import _collect_conflict_values
 from .facts import get_endpoints
@@ -265,14 +266,19 @@ def _is_stored_text_replaced(change: ConflictChange) -> bool:
     return EdgeType.id_for(change.stored["text"]) != EdgeType.id_for(change.accepted.conflict.text)
 
 
+def _replaced_texts(changes: list[ConflictChange]) -> set[str]:
+    return {change.stored["text"] for change in changes if _is_stored_text_replaced(change)}
+
+
 async def _delete_replaced_text_embeddings(vector_engine, changes: list[ConflictChange]) -> None:
     """Drop the embedding of every conflict explanation this write replaced.
 
     An explanation is stored as an EdgeType relationship name and indexed, so a
     stale one keeps matching searches after the conflict it explained was
-    rewritten or dropped.
+    rewritten or dropped. Backends without the EdgeType lifecycle only: there the
+    replaced texts are lifecycle candidates, dropped only when no live edge holds them.
     """
-    texts = {change.stored["text"] for change in changes if _is_stored_text_replaced(change)}
+    texts = _replaced_texts(changes)
     if not texts:
         return
     try:
@@ -284,7 +290,9 @@ async def _delete_replaced_text_embeddings(vector_engine, changes: list[Conflict
         pass
 
 
-async def _delete_value_and_citation_links(graph_engine, changes: list[ConflictChange]) -> None:
+async def _delete_value_and_citation_links(
+    graph_engine, vector_engine, changes: list[ConflictChange]
+) -> None:
     """Clear a rewritten conflict's old value and citation links before writing new ones.
 
     A dropped conflict keeps its links until finalizing deletes its node with them.
@@ -301,7 +309,9 @@ async def _delete_value_and_citation_links(graph_engine, changes: list[ConflictC
     ]
     if not triples:
         return
-    await graph_engine.delete_edge_triples(triples)
+    # Joins the caller's EdgeType lifecycle block: the links' texts become candidates.
+    async with edge_type_lifecycle(graph_engine, vector_engine, edge_identities=triples):
+        await graph_engine.delete_edge_triples(triples)
 
 
 def _choose_value_statuses(accepted: AcceptedConflict, facts: dict[str, dict]) -> dict[str, str]:
@@ -392,22 +402,35 @@ async def _write_conflict_changes(unified, to_write: ConflictsToWrite, ctx) -> N
     # The pending-write marker goes first: if a step below fails, the next run finds the
     # marker and reviews the conflict again.
     await _mark_conflicts_pending(changes, conflict_ctx)
-    await _update_fact_properties(unified.graph, to_write, changes)
-    await _delete_replaced_text_embeddings(unified.vector, changes)
-    await _delete_value_and_citation_links(unified.graph, changes)
-    await _save_conflict_nodes(changes, to_write.scope, conflict_ctx)
+    # One EdgeType lifecycle block (Neo4j + PGVector) over the fact rewrite, the
+    # removal of old links and the new conflict write: the replaced explanations
+    # and the removed links' texts are candidates, dropped after the block only
+    # when no live edge still holds them. Other backends keep the direct delete.
+    async with edge_type_lifecycle(
+        unified.graph, unified.vector, candidate_texts=_replaced_texts(changes)
+    ) as lifecycle:
+        await _update_fact_properties(unified.graph, to_write, changes)
+        if lifecycle is None:
+            await _delete_replaced_text_embeddings(unified.vector, changes)
+        await _delete_value_and_citation_links(unified.graph, unified.vector, changes)
+        await _save_conflict_nodes(changes, to_write.scope, conflict_ctx)
     _update_scope_conflicts(changes, to_write.scope)
 
 
-async def _finalize_run(graph_engine, to_finalize: ConflictsToFinalize) -> None:
+async def _finalize_run(graph_engine, vector_engine, to_finalize: ConflictsToFinalize) -> None:
     """Clear or delete every conflict the run touched; no further write depends on them."""
     for accepted in to_finalize.accepted_conflicts:
         conflict = accepted.conflict.model_copy(
             update={"write_pending": accepted.conflict.cache_cleanup_pending}
         )
         await graph_engine.add_nodes([conflict])
-    for conflict_id in to_finalize.dropped_conflict_ids:
-        await graph_engine.delete_nodes([conflict_id])
+    # A dropped conflict's links leave with its node; their texts are EdgeType
+    # lifecycle candidates, snapshotted before the first delete.
+    async with edge_type_lifecycle(
+        graph_engine, vector_engine, node_ids=to_finalize.dropped_conflict_ids
+    ):
+        for conflict_id in to_finalize.dropped_conflict_ids:
+            await graph_engine.delete_nodes([conflict_id])
 
 
 async def write_conflicts(items, ctx) -> None:
@@ -415,6 +438,6 @@ async def write_conflicts(items, ctx) -> None:
     item = items[0]  # batch_size=1: the enrichment stream hands over one item at a time.
     unified = await get_unified_engine()
     if isinstance(item, ConflictsToFinalize):
-        await _finalize_run(unified.graph, item)
+        await _finalize_run(unified.graph, unified.vector, item)
     else:
         await _write_conflict_changes(unified, item, ctx)

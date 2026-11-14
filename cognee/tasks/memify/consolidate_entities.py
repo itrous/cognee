@@ -27,9 +27,11 @@ from uuid import UUID
 import numpy as np
 
 from cognee.infrastructure.databases.graph import get_graph_engine
+from cognee.infrastructure.databases.provenance import EdgeIdentity
 from cognee.infrastructure.databases.vector import get_vector_engine
 from cognee.modules.engine.models.Entity import Entity
 from cognee.shared.logging_utils import get_logger
+from cognee.tasks.storage.edge_type_lifecycle import edge_type_lifecycle
 
 logger = get_logger("consolidate_entities")
 
@@ -509,38 +511,50 @@ async def merge_entity_duplicates(
     graph_engine = await get_graph_engine()
     vector_engine = get_vector_engine()
 
-    # 1. Re-point every duplicate edge onto its canonical in a single batched
-    #    call. add_edges is part of GraphDBInterface and implemented by every
-    #    adapter, so a large cluster costs one round-trip instead of one await
-    #    per edge. The 4-tuples (source, target, relationship, properties) are
-    #    passed positionally because adapters disagree on the 4th field's name
-    #    (properties vs edge_properties); position is stable across all of them.
-    if moved_edges:
-        await graph_engine.add_edges(moved_edges)
+    # One EdgeType lifecycle block (Neo4j + PGVector) from the snapshot of the
+    # duplicates' edges and the repoint targets to the duplicates' deletion: texts
+    # the repointed edges carry stay live, only those no edge keeps are dropped.
+    async with edge_type_lifecycle(
+        graph_engine,
+        vector_engine,
+        edge_identities=[
+            EdgeIdentity(str(source), str(target), str(relationship))
+            for source, target, relationship, *_ in moved_edges
+        ],
+        node_ids=duplicate_ids,
+    ):
+        # 1. Re-point every duplicate edge onto its canonical in a single batched
+        #    call. add_edges is part of GraphDBInterface and implemented by every
+        #    adapter, so a large cluster costs one round-trip instead of one await
+        #    per edge. The 4-tuples (source, target, relationship, properties) are
+        #    passed positionally because adapters disagree on the 4th field's name
+        #    (properties vs edge_properties); position is stable across all of them.
+        if moved_edges:
+            await graph_engine.add_edges(moved_edges)
 
-    # 2. Persist the rebuilt canonicals (add_nodes upserts via ON MATCH SET).
-    #    Each rebuilt canonical carries the union of its cluster's descriptions
-    #    AND belongs_to_set tags (see _build_canonical_entity). belongs_to_set is
-    #    a node property, so it must be unioned here — edge re-pointing in step 1
-    #    cannot preserve it.
-    updated_canonicals = [
-        entity
-        for canonical, duplicates in plans
-        if duplicates
-        for entity in [_build_canonical_entity(canonical, duplicates)]
-        if entity is not None
-    ]
-    if updated_canonicals:
-        await graph_engine.add_nodes(updated_canonicals)
+        # 2. Persist the rebuilt canonicals (add_nodes upserts via ON MATCH SET).
+        #    Each rebuilt canonical carries the union of its cluster's descriptions
+        #    AND belongs_to_set tags (see _build_canonical_entity). belongs_to_set is
+        #    a node property, so it must be unioned here — edge re-pointing in step 1
+        #    cannot preserve it.
+        updated_canonicals = [
+            entity
+            for canonical, duplicates in plans
+            if duplicates
+            for entity in [_build_canonical_entity(canonical, duplicates)]
+            if entity is not None
+        ]
+        if updated_canonicals:
+            await graph_engine.add_nodes(updated_canonicals)
 
-    # 3. Delete the duplicates (detach-delete cascades their old edges) and
-    #    purge their name embeddings, or stale vectors resurface in later runs.
-    if duplicate_ids:
-        await graph_engine.delete_nodes(duplicate_ids)
-        # Duplicate ids are already strings. Sibling deletion code (e.g.
-        # delete_from_graph_and_vector) likewise passes string ids, which keeps
-        # this adapter-agnostic and avoids a UUID() cast that could raise.
-        await vector_engine.delete_data_points(ENTITY_VECTOR_COLLECTION, duplicate_ids)
+        # 3. Delete the duplicates (detach-delete cascades their old edges) and
+        #    purge their name embeddings, or stale vectors resurface in later runs.
+        if duplicate_ids:
+            await graph_engine.delete_nodes(duplicate_ids)
+            # Duplicate ids are already strings. Sibling deletion code (e.g.
+            # delete_from_graph_and_vector) likewise passes string ids, which keeps
+            # this adapter-agnostic and avoids a UUID() cast that could raise.
+            await vector_engine.delete_data_points(ENTITY_VECTOR_COLLECTION, duplicate_ids)
 
     logger.info(
         "consolidate_entities: merged %d duplicate(s) into %d canonical(s).",

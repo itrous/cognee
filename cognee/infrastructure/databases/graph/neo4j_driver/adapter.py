@@ -11,7 +11,7 @@ from typing import Any
 from uuid import UUID
 
 from neo4j import AsyncGraphDatabase, AsyncSession
-from neo4j.exceptions import Neo4jError
+from neo4j.exceptions import Neo4jError, ServiceUnavailable, SessionExpired
 
 from cognee.infrastructure.databases.exceptions import DatabaseCredentialsError
 from cognee.infrastructure.databases.graph.graph_db_interface import (
@@ -242,7 +242,7 @@ class Neo4jAdapter(GraphDBInterface):
         MATCH (n:`{BASE_LABEL}`)
         }} AS node_exists;
         """
-        query_result = await self.query(query)
+        query_result = await self._query_retryable(query)
         return not query_result[0]["node_exists"]
 
     @deadlock_retry()
@@ -253,6 +253,9 @@ class Neo4jAdapter(GraphDBInterface):
     ) -> list[dict[str, Any]]:
         """
         Execute a Cypher query against the Neo4j database and return the result.
+
+        Retries only the server-side errors ``deadlock_retry`` always retried: an
+        arbitrary query may not be safe to replay after a lost connection.
 
         Parameters:
         -----------
@@ -267,6 +270,27 @@ class Neo4jAdapter(GraphDBInterface):
             - List[Dict[str, Any]]: A list of dictionaries representing the result of the query
               execution.
         """
+        return await self._query_once(query, params)
+
+    @deadlock_retry(retry_connection_errors=True)
+    async def _query_retryable(
+        self,
+        query: str,
+        params: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """``query`` that also retries a lost connection, each attempt in a new session.
+
+        Only for the safe reads and the idempotent MERGE / SET / DELETE writes of this
+        adapter that were checked one by one; never for caller-supplied Cypher.
+        """
+        return await self._query_once(query, params)
+
+    async def _query_once(
+        self,
+        query: str,
+        params: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """One attempt: open a session, run, read every row and close the session."""
         with new_span("cognee.db.graph.query") as otel_span:
             otel_span.set_attribute(COGNEE_DB_SYSTEM, "neo4j")
             otel_span.set_attribute(COGNEE_DB_QUERY, redact_secrets(query[:500]))
@@ -277,7 +301,7 @@ class Neo4jAdapter(GraphDBInterface):
                     data = await result.data()
                     otel_span.set_attribute(COGNEE_DB_ROW_COUNT, len(data))
                     return data
-            except Neo4jError as error:
+            except (Neo4jError, ServiceUnavailable, SessionExpired) as error:
                 otel_span.set_status(StatusCode.ERROR, str(error))
                 otel_span.record_exception(error)
                 logger.exception("Neo4j query error")
@@ -440,7 +464,7 @@ class Neo4jAdapter(GraphDBInterface):
         # source_ref_keys that attach/remove rewrite under the lock; without the
         # lock a fold landing between their read and write is lost.
         async with self._source_ref_change_lock if source_ref_key is not None else nullcontext():
-            results = await self.query(
+            results = await self._query_retryable(
                 query, {"nodes": list(deduped.values()), **provenance_params}
             )
         return results
@@ -604,7 +628,7 @@ class Neo4jAdapter(GraphDBInterface):
 
         params = {"node_ids": node_ids}
 
-        return await self.query(query, params)
+        return await self._query_retryable(query, params)
 
     # ------------------------------------------------------------------
     # Graph provenance (COG-5522)
@@ -836,7 +860,7 @@ class Neo4jAdapter(GraphDBInterface):
         edge_params = [self._edge_identity_row(edge) for edge in edges]
         # DELETE r (not DETACH DELETE) removes only the matched relationships and
         # preserves the endpoint nodes.
-        await self.query(
+        await self._query_retryable(
             f"""
             UNWIND $edges AS e
             MATCH (a:`{BASE_LABEL}`)-[r]->(b:`{BASE_LABEL}`)
@@ -922,7 +946,7 @@ class Neo4jAdapter(GraphDBInterface):
         """Project planner fields only: shared nodes can carry very large run history."""
         if not node_ids:
             return {}
-        rows = await self.query(
+        rows = await self._query_retryable(
             f"""
             MATCH (n:`{BASE_LABEL}`) WHERE n.id IN $ids
             RETURN n.id AS id, n.type AS node_type, n.metadata AS metadata, n.name AS name,
@@ -947,7 +971,7 @@ class Neo4jAdapter(GraphDBInterface):
         """Read complete ownership without transferring relationship properties/run refs."""
         if not edges:
             return {}
-        rows = await self.query(
+        rows = await self._query_retryable(
             f"""
             UNWIND $edges AS e
             MATCH (a:`{BASE_LABEL}`)-[r]->(b:`{BASE_LABEL}`)
@@ -980,7 +1004,7 @@ class Neo4jAdapter(GraphDBInterface):
             "\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a"
             "\u2028\u2029\u202f\u205f\u3000"
         )
-        rows = await self.query(
+        rows = await self._query_retryable(
             f"""
             MATCH (a:`{BASE_LABEL}`)-[r]->(b:`{BASE_LABEL}`)
             WITH r, CASE WHEN r.edge_text IS :: STRING
@@ -1004,6 +1028,68 @@ class Neo4jAdapter(GraphDBInterface):
             if (text := get_edge_retrieval_text(row["edge_text"], row["rel"]))
             and text in candidates
         }
+
+    async def get_incident_edge_retrieval_texts(self, node_ids: list[str]) -> set[str]:
+        """Retrieval texts of every edge touching the given nodes; nothing else is read."""
+        if not node_ids:
+            return set()
+        rows = await self._query_retryable(
+            f"""
+            MATCH (n:`{BASE_LABEL}`)-[r]-(:`{BASE_LABEL}`) WHERE n.id IN $ids
+            WITH DISTINCT r
+            RETURN r.edge_text AS edge_text, type(r) AS rel
+            """,
+            {"ids": list(node_ids)},
+        )
+        from cognee.modules.graph.utils.prepare_edges_for_storage import get_edge_retrieval_text
+
+        return {
+            text for row in rows if (text := get_edge_retrieval_text(row["edge_text"], row["rel"]))
+        }
+
+    async def get_existing_edge_type_ids(self, candidate_ids: set[str]) -> set[str]:
+        """Return the EdgeType ids among ``candidate_ids`` that a live edge still produces.
+
+        Streams ``edge_text`` and ``type(r)`` of every edge of the physical graph and
+        computes the id with the same Python ``EdgeType.id_for`` the indexer uses, so
+        the comparison never depends on a Cypher copy of the normalization. Only the
+        intersection with the candidates is kept.
+        """
+        if not candidate_ids:
+            return set()
+        return await self._read_existing_edge_type_ids(frozenset(candidate_ids))
+
+    @deadlock_retry(retry_connection_errors=True)
+    async def _read_existing_edge_type_ids(self, candidate_ids: frozenset[str]) -> set[str]:
+        """One complete read: the accumulator belongs to this attempt only."""
+        from cognee.modules.graph.models.EdgeType import EdgeType
+        from cognee.modules.graph.utils.prepare_edges_for_storage import get_edge_retrieval_text
+
+        query = (
+            f"MATCH (:`{BASE_LABEL}`)-[r]->(:`{BASE_LABEL}`) "
+            "RETURN r.edge_text AS edge_text, type(r) AS rel"
+        )
+        with new_span("cognee.db.graph.query") as otel_span:
+            otel_span.set_attribute(COGNEE_DB_SYSTEM, "neo4j")
+            otel_span.set_attribute(COGNEE_DB_QUERY, query)
+            found: set[str] = set()
+            rows = 0
+            try:
+                async with self.get_session() as session:
+                    result = await session.run(query)
+                    async for record in result:
+                        rows += 1
+                        text = get_edge_retrieval_text(record["edge_text"], record["rel"])
+                        if text and (edge_type_id := str(EdgeType.id_for(text))) in candidate_ids:
+                            found.add(edge_type_id)
+                    await result.consume()
+            except (Neo4jError, ServiceUnavailable, SessionExpired) as error:
+                otel_span.set_status(StatusCode.ERROR, str(error))
+                otel_span.record_exception(error)
+                logger.exception("Neo4j query error")
+                raise
+            otel_span.set_attribute(COGNEE_DB_ROW_COUNT, rows)
+            return found
 
     async def find_nodes_by_source_ref(self, source_ref_key: str) -> list[str]:
         rows = await self.query(
@@ -1031,7 +1117,7 @@ class Neo4jAdapter(GraphDBInterface):
         ]
 
     async def find_node_source_refs_by_dataset(self, dataset_id: str) -> dict[str, list[str]]:
-        rows = await self.query(
+        rows = await self._query_retryable(
             f"""
             MATCH (n:`{BASE_LABEL}`)
             WHERE $token IN coalesce(n.source_dataset_ids, [])
@@ -1053,7 +1139,7 @@ class Neo4jAdapter(GraphDBInterface):
     async def find_edge_source_refs_by_dataset(
         self, dataset_id: str
     ) -> dict[EdgeIdentity, list[str]]:
-        rows = await self.query(
+        rows = await self._query_retryable(
             f"""
             MATCH (a:`{BASE_LABEL}`)-[r]->(b:`{BASE_LABEL}`)
             WHERE $token IN coalesce(r.source_dataset_ids, [])
@@ -1128,13 +1214,15 @@ class Neo4jAdapter(GraphDBInterface):
         # GraphMetadata carries no `__Node__` label so is_empty()/get_graph_data()
         # (both scoped to `__Node__`) never count the marker as data.
         for key, value in metadata.items():
-            await self.query(
+            await self._query_retryable(
                 "MERGE (m:GraphMetadata {key: $k}) SET m.value = $v",
                 {"k": str(key), "v": str(value)},
             )
 
     async def get_graph_metadata(self) -> dict[str, str]:
-        rows = await self.query("MATCH (m:GraphMetadata) RETURN m.key AS key, m.value AS value")
+        rows = await self._query_retryable(
+            "MATCH (m:GraphMetadata) RETURN m.key AS key, m.value AS value"
+        )
         return {row["key"]: row["value"] for row in rows}
 
     async def has_edge(self, from_node: UUID, to_node: UUID, edge_label: str) -> bool:
@@ -1371,7 +1459,7 @@ class Neo4jAdapter(GraphDBInterface):
             async with (
                 self._source_ref_change_lock if source_ref_key is not None else nullcontext()
             ):
-                results = await self.query(query, {"edges": edges, **provenance_params})
+                results = await self._query_retryable(query, {"edges": edges, **provenance_params})
             return results
         except Neo4jError:
             logger.exception("Neo4j query error")
@@ -1942,7 +2030,7 @@ class Neo4jAdapter(GraphDBInterface):
                 f"MATCH (n:`{BASE_LABEL}`) "
                 "RETURN ID(n) AS id, labels(n) AS labels, properties(n) AS properties"
             )
-            result = await self.query(query)
+            result = await self._query_retryable(query)
 
             nodes = []
             for record in result:
@@ -1959,7 +2047,7 @@ class Neo4jAdapter(GraphDBInterface):
             MATCH (n:`{BASE_LABEL}`)-[r]->(m:`{BASE_LABEL}`)
             RETURN ID(n) AS source, ID(m) AS target, TYPE(r) AS type, properties(r) AS properties
             """
-            result = await self.query(query)
+            result = await self._query_retryable(query)
 
             edges = []
             for record in result:
@@ -2024,7 +2112,7 @@ class Neo4jAdapter(GraphDBInterface):
             if edge_types:
                 params["edge_types"] = edge_types
 
-            result = await self.query(path_query, params)
+            result = await self._query_retryable(path_query, params)
             neighbor_ids = [record["nid"] for record in result if record.get("nid")]
 
             all_ids = list(set(node_ids) | set(neighbor_ids))
@@ -2035,7 +2123,7 @@ class Neo4jAdapter(GraphDBInterface):
             WHERE n.id IN $ids
             RETURN n.id AS id, properties(n) AS properties
             """
-            nodes_result = await self.query(nodes_query, {"ids": all_ids})
+            nodes_result = await self._query_retryable(nodes_query, {"ids": all_ids})
             nodes = []
             for record in nodes_result:
                 properties = _strip_provenance(record["properties"])
@@ -2047,7 +2135,7 @@ class Neo4jAdapter(GraphDBInterface):
             WHERE n.id IN $ids AND m.id IN $ids
             RETURN properties(r) AS properties, TYPE(r) AS type
             """
-            edges_result = await self.query(edges_query, {"ids": all_ids})
+            edges_result = await self._query_retryable(edges_query, {"ids": all_ids})
             edges = []
             for record in edges_result:
                 properties = _strip_provenance(record["properties"])
@@ -2071,7 +2159,7 @@ class Neo4jAdapter(GraphDBInterface):
             logger.error(f"Error during neighborhood retrieval: {e!s}")
             raise
 
-    @deadlock_retry()
+    @deadlock_retry(retry_connection_errors=True)
     async def _read_id_filtered_rows(
         self, edges_query: str, nodes_query: str, target_ids: list[str]
     ) -> tuple[dict[str, tuple[str, dict[str, Any]]], list[tuple[Any, Any, str, dict[str, Any]]]]:
@@ -2083,7 +2171,8 @@ class Neo4jAdapter(GraphDBInterface):
         and the properties stripped once per node. An edge whose endpoint the second query did
         not return (deleted in between) is dropped, never given invented properties; the
         projection skips such edges as well. Mirrors ``query()``'s retry, span and error
-        logging, which a streamed read cannot reuse.
+        logging, which a streamed read cannot reuse. A retry repeats the whole two-query
+        transaction with fresh accumulators; a failed close never hides the read's error.
         """
         with new_span("cognee.db.graph.query") as otel_span:
             otel_span.set_attribute(COGNEE_DB_SYSTEM, "neo4j")
@@ -2115,9 +2204,16 @@ class Neo4jAdapter(GraphDBInterface):
                         )
                         async for record in result:
                             props_by_id[record["id"]] = _strip_provenance(record["properties"])
-                    finally:
-                        await transaction.close()
-            except Neo4jError as error:
+                    except BaseException:
+                        try:
+                            await transaction.close()
+                        except Exception:
+                            logger.warning(
+                                "Closing a failed Neo4j read transaction failed", exc_info=True
+                            )
+                        raise
+                    await transaction.close()
+            except (Neo4jError, ServiceUnavailable, SessionExpired) as error:
                 otel_span.set_status(StatusCode.ERROR, str(error))
                 otel_span.record_exception(error)
                 logger.exception("Neo4j query error")
@@ -2335,7 +2431,7 @@ class Neo4jAdapter(GraphDBInterface):
         WHERE {where_clause}
         RETURN n.id AS id, labels(n) AS labels, properties(n) AS properties
         """
-        result_nodes = await self.query(query_nodes)
+        result_nodes = await self._query_retryable(query_nodes)
 
         nodes = [
             (
@@ -2353,7 +2449,7 @@ class Neo4jAdapter(GraphDBInterface):
         WHERE {where_clause} AND {where_clause.replace("n.", "m.")}
         RETURN n.id AS source, m.id AS target, TYPE(r) AS type, properties(r) AS properties
         """
-        result_edges = await self.query(query_edges)
+        result_edges = await self._query_retryable(query_edges)
 
         edges = []
         for record in result_edges:

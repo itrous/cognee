@@ -1,4 +1,5 @@
 from cognee.infrastructure.databases.graph.get_graph_engine import get_graph_engine
+from cognee.infrastructure.databases.provenance import EdgeIdentity
 from cognee.infrastructure.databases.vector.get_vector_engine import get_vector_engine_async
 from cognee.modules.engine.utils import generate_node_id
 from cognee.modules.graph.legacy.mark_ledger_as_deleted import (
@@ -9,6 +10,7 @@ from cognee.modules.graph.models import Edge, Node
 from cognee.modules.graph.models.EdgeType import EdgeType
 from cognee.modules.graph.utils.prepare_edges_for_storage import get_edge_retrieval_text
 from cognee.shared.logging_utils import get_logger
+from cognee.tasks.storage.edge_type_lifecycle import edge_type_lifecycle
 
 logger = get_logger("delete_from_graph_and_vector")
 
@@ -23,32 +25,19 @@ def _get_remaining_edge_retrieval_text(edge) -> str:
     return get_edge_retrieval_text(properties.get("edge_text"), edge[2])
 
 
-async def delete_from_graph_and_vector(
-    affected_nodes: list[Node],
-    affected_edges: list[Edge],
-    is_legacy_node: list[bool],
-    is_legacy_edge: list[bool],
+async def _delete_graph_and_vectors(
+    graph_engine,
+    vector_engine,
+    unique_nodes: list[Node],
+    unique_edges: list[Edge],
+    legacy_edge_types,
 ) -> None:
-    """Delete non-legacy nodes/edges from graph DB, vector DB, and mark ledger entries.
+    """Delete nodes and their vectors, edge vectors, and NodeSet tags.
 
-    Shared logic used by both data-level and dataset-level deletion flows.
-    Deduplicates by slug before issuing deletes to avoid redundant I/O.
+    ``legacy_edge_types`` keeps the pre-lifecycle EdgeType handling (text-id
+    vector delete and graph EdgeType node cleanup) for backends the EdgeType
+    lifecycle does not cover.
     """
-    non_legacy_nodes = [
-        node for index, node in enumerate(affected_nodes) if not is_legacy_node[index]
-    ]
-    non_legacy_edges = [
-        edge for index, edge in enumerate(affected_edges) if not is_legacy_edge[index]
-    ]
-
-    # Deduplicate nodes by slug to avoid redundant graph/vector deletes
-    seen_node_slugs = set()
-    unique_nodes = []
-    for node in non_legacy_nodes:
-        if node.slug not in seen_node_slugs:
-            seen_node_slugs.add(node.slug)
-            unique_nodes.append(node)
-
     # Capture NodeSet names before their ledger/graph rows are deleted so
     # we can strip these tags from any surviving shared DataPoint afterwards.
     # When a dataset is deleted in single-tenant mode its uniquely-owned
@@ -60,11 +49,8 @@ async def delete_from_graph_and_vector(
         node.label for node in unique_nodes if node.type == "NodeSet" and node.label
     }
 
-    graph_engine = None
-
     # Delete from graph DB
     if unique_nodes:
-        graph_engine = await get_graph_engine()
         await graph_engine.delete_nodes([str(node.slug) for node in unique_nodes])
 
     # Delete from vector DB - group by collection
@@ -74,27 +60,19 @@ async def delete_from_graph_and_vector(
             collection_name = f"{node.type}_{indexed_field}"
             affected_vector_collections.setdefault(collection_name, []).append(node)
 
-    vector_engine = await get_vector_engine_async()
     for collection, nodes in affected_vector_collections.items():
         await vector_engine.delete_data_points(collection, [str(node.slug) for node in nodes])
 
     # Delete edge embeddings and triplets
-    if non_legacy_edges:
-        # Deduplicate edges by slug
-        seen_edge_slugs = set()
-        unique_edges = []
-        for edge in non_legacy_edges:
-            if edge.slug not in seen_edge_slugs:
-                seen_edge_slugs.add(edge.slug)
-                unique_edges.append(edge)
+    if unique_edges:
+        if legacy_edge_types:
+            edge_type_ids = []
+            for edge in unique_edges:
+                edge_text = _get_deleted_edge_retrieval_text(edge)
+                if edge_text:
+                    edge_type_ids.append(str(EdgeType.id_for(edge_text)))
 
-        edge_type_ids = []
-        for edge in unique_edges:
-            edge_text = _get_deleted_edge_retrieval_text(edge)
-            if edge_text:
-                edge_type_ids.append(str(EdgeType.id_for(edge_text)))
-
-        await vector_engine.delete_data_points("EdgeType_relationship_name", edge_type_ids)
+            await vector_engine.delete_data_points("EdgeType_relationship_name", edge_type_ids)
 
         # Legacy: cognee no longer writes Triplet_text (SDK-1115), but databases
         # built before then may still hold it, so deleted edges drop their rows.
@@ -119,7 +97,7 @@ async def delete_from_graph_and_vector(
     # EdgeType nodes are created by index_graph_edges for each unique edge
     # retrieval text. When edges are deleted, check if any edges with that
     # retrieval text remain in the graph. If not, remove the EdgeType node.
-    if non_legacy_edges:
+    if unique_edges and legacy_edge_types:
         deleted_edge_texts = set()
         for edge in unique_edges:
             edge_text = _get_deleted_edge_retrieval_text(edge)
@@ -127,8 +105,6 @@ async def delete_from_graph_and_vector(
                 deleted_edge_texts.add(edge_text)
 
         try:
-            if not graph_engine:
-                graph_engine = await get_graph_engine()
             _, remaining_edges = await graph_engine.get_graph_data()
             remaining_edge_texts = set()
             for edge in remaining_edges:
@@ -168,6 +144,64 @@ async def delete_from_graph_and_vector(
             await vector_engine.remove_belongs_to_set_tags(tags_to_remove)
         except Exception as e:
             logger.warning("Vector NodeSet tag cleanup failed (non-fatal): %s", e, exc_info=True)
+
+
+async def delete_from_graph_and_vector(
+    affected_nodes: list[Node],
+    affected_edges: list[Edge],
+    is_legacy_node: list[bool],
+    is_legacy_edge: list[bool],
+) -> None:
+    """Delete non-legacy nodes/edges from graph DB, vector DB, and mark ledger entries.
+
+    Shared logic used by both data-level and dataset-level deletion flows.
+    Deduplicates by slug before issuing deletes to avoid redundant I/O.
+    """
+    non_legacy_nodes = [
+        node for index, node in enumerate(affected_nodes) if not is_legacy_node[index]
+    ]
+    non_legacy_edges = [
+        edge for index, edge in enumerate(affected_edges) if not is_legacy_edge[index]
+    ]
+
+    # Deduplicate nodes by slug to avoid redundant graph/vector deletes
+    seen_node_slugs = set()
+    unique_nodes = []
+    for node in non_legacy_nodes:
+        if node.slug not in seen_node_slugs:
+            seen_node_slugs.add(node.slug)
+            unique_nodes.append(node)
+
+    # Deduplicate edges by slug
+    seen_edge_slugs = set()
+    unique_edges = []
+    for edge in non_legacy_edges:
+        if edge.slug not in seen_edge_slugs:
+            seen_edge_slugs.add(edge.slug)
+            unique_edges.append(edge)
+
+    graph_engine = await get_graph_engine() if unique_nodes or unique_edges else None
+    vector_engine = await get_vector_engine_async()
+
+    # EdgeType vectors are keyed by shared text. On Neo4j + PGVector the lifecycle
+    # snapshots the texts of the listed edges and of every edge incident to the
+    # deleted nodes, and after the deletion drops only the ids no live edge
+    # produces. Other backends keep the previous text-id path below.
+    async with edge_type_lifecycle(
+        graph_engine,
+        vector_engine,
+        edge_identities=[
+            EdgeIdentity(
+                str(edge.source_node_id), str(edge.destination_node_id), edge.relationship_name
+            )
+            for edge in unique_edges
+        ],
+        node_ids=[str(node.slug) for node in unique_nodes],
+        candidate_texts=[_get_deleted_edge_retrieval_text(edge) for edge in unique_edges],
+    ) as lifecycle:
+        await _delete_graph_and_vectors(
+            graph_engine, vector_engine, unique_nodes, unique_edges, lifecycle is None
+        )
 
     # Mark ledger entries as deleted
     await mark_ledger_nodes_as_deleted([node.slug for node in non_legacy_nodes])

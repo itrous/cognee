@@ -85,6 +85,7 @@ def _neo4j():
 
     adapter = object.__new__(Neo4jAdapter)
     adapter.query = AsyncMock(return_value=[])
+    adapter._query_retryable = adapter.query  # add_nodes/add_edges use the retrying entrypoint
     return adapter
 
 

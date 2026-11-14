@@ -757,3 +757,122 @@ async def test_add_data_points_relational_upserts_happen_before_graph_and_vector
     )
     assert call_order[:3] == ["upsert_nodes", "upsert_edges", "upsert_edges"]
     assert first_graph_index >= 3
+
+
+# --- EdgeType lifecycle on the Neo4j + PGVector pair -------------------------
+# Spec'd mocks make isinstance() see the real adapter classes, so add_data_points
+# enters the lifecycle; the advisory lock is recorded instead of taken.
+
+
+def _lifecycle_pair(monkeypatch, calls):
+    pytest.importorskip("neo4j")
+    pytest.importorskip("asyncpg")
+    from cognee.infrastructure.databases.graph.neo4j_driver.adapter import Neo4jAdapter
+    from cognee.infrastructure.databases.provenance import EdgeDeletePlanData
+    from cognee.infrastructure.databases.vector.pgvector.PGVectorAdapter import PGVectorAdapter
+
+    lifecycle_module = sys.modules["cognee.tasks.storage.edge_type_lifecycle"]
+
+    class _RecordedLock:
+        def __init__(self, vector_adapter):
+            pass
+
+        async def acquire(self):
+            calls.append("lock")
+
+        async def ensure_held(self):
+            calls.append("ensure_held")
+
+        async def release(self):
+            calls.append("unlock")
+
+    monkeypatch.setattr(lifecycle_module, "_AdvisoryLock", _RecordedLock)
+
+    graph = AsyncMock(spec=Neo4jAdapter)
+    graph.is_empty = AsyncMock(return_value=False)
+    graph.get_graph_metadata = AsyncMock(return_value={})
+
+    async def plan(edges):
+        calls.append("snapshot")
+        return {edge: EdgeDeletePlanData(edge, "old text", []) for edge in edges}
+
+    async def existing(candidate_ids):
+        calls.append("scan")
+        return set()
+
+    graph.get_edge_delete_plan_data = AsyncMock(side_effect=plan)
+    graph.get_existing_edge_type_ids = AsyncMock(side_effect=existing)
+    graph.add_nodes = AsyncMock(side_effect=lambda *a, **k: calls.append("add_nodes"))
+    graph.add_edges = AsyncMock(side_effect=lambda *a, **k: calls.append("add_edges"))
+    vector = MagicMock(spec=PGVectorAdapter)
+    vector.has_collection = AsyncMock(return_value=True)
+    vector.delete_data_points = AsyncMock(side_effect=lambda *a: calls.append("delete_vectors"))
+    unified = SimpleNamespace(graph=graph, vector=vector, has_capability=lambda capability: False)
+    monkeypatch.setattr(adp_module, "get_unified_engine", AsyncMock(return_value=unified))
+    return graph, vector
+
+
+@pytest.mark.asyncio
+async def test_graph_only_and_index_edges_false(monkeypatch):
+    from cognee.modules.graph.models.EdgeType import EdgeType
+
+    calls: list[str] = []
+    graph, vector = _lifecycle_pair(monkeypatch, calls)
+    index_nodes = AsyncMock(side_effect=lambda *a, **k: calls.append("index_nodes"))
+    index_edges = AsyncMock(side_effect=lambda *a, **k: calls.append("index_edges"))
+    monkeypatch.setattr(adp_module, "index_data_points", index_nodes)
+    monkeypatch.setattr(adp_module, "index_graph_edges", index_edges)
+    dp1, dp2 = SimplePoint(text="first"), SimplePoint(text="second")
+    edges = [(str(dp1.id), str(dp2.id), "related_to", {"edge_text": "new text"})]
+
+    # Order: lock, snapshot before the first write, writes as before, cleanup last.
+    await add_data_points([dp1, dp2], custom_edges=edges)
+    assert calls == [
+        "lock",
+        "snapshot",
+        "add_nodes",
+        "index_nodes",
+        "index_edges",  # the (empty) model edges
+        "add_edges",  # the custom edges
+        "index_edges",
+        "ensure_held",
+        "scan",
+        "delete_vectors",
+        "unlock",
+    ]
+    assert index_edges.await_args.kwargs["graph_engine"] is graph
+    vector.delete_data_points.assert_awaited_once_with(
+        "EdgeType_relationship_name", [str(EdgeType.id_for("old text"))]
+    )
+
+    # index_edges=False: no new EdgeType embedding, but the overwritten text is
+    # still checked and dropped.
+    calls.clear()
+    await add_data_points([dp1, dp2], custom_edges=edges, index_edges=False)
+    assert "index_edges" not in calls
+    assert calls[-3:] == ["scan", "delete_vectors", "unlock"]
+
+    # graph_only: no unified engine (so no vector engine), no lock, no snapshot.
+    calls.clear()
+    monkeypatch.setattr(
+        adp_module,
+        "get_unified_engine",
+        AsyncMock(side_effect=AssertionError("graph_only must not resolve a vector engine")),
+    )
+    graph_module = sys.modules["cognee.infrastructure.databases.graph.get_graph_engine"]
+    monkeypatch.setattr(graph_module, "get_graph_engine", AsyncMock(return_value=graph))
+    await add_data_points([dp1, dp2], custom_edges=edges, graph_only=True)
+    assert calls == ["add_nodes", "add_edges"]
+
+
+@pytest.mark.asyncio
+async def test_batch_without_edges_takes_no_lifecycle_lock(monkeypatch):
+    calls: list[str] = []
+    _lifecycle_pair(monkeypatch, calls)
+    monkeypatch.setattr(adp_module, "index_data_points", AsyncMock())
+    monkeypatch.setattr(adp_module, "index_graph_edges", AsyncMock())
+
+    await add_data_points([SimplePoint(text="alone")])
+
+    assert "lock" not in calls
+    assert calls == ["add_nodes"]

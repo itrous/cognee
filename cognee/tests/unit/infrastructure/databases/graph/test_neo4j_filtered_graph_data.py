@@ -31,6 +31,8 @@ async def test_filtered_graph_edges_fall_back_to_returned_endpoint_ids():
         ]
     )
 
+    adapter._query_retryable = adapter.query  # the read goes through the retrying entrypoint
+
     _nodes, edges = await adapter.get_filtered_graph_data([{"type": ["CodeSymbol"]}])
 
     assert edges == [("source", "target", "calls", {})]

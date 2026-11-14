@@ -10,6 +10,7 @@ from cognee.modules.graph.models.EdgeType import EdgeType
 from cognee.modules.graph.utils.convert_node_to_data_point import get_all_subclasses
 from cognee.modules.graph.utils.prepare_edges_for_storage import get_edge_retrieval_text
 from cognee.shared.logging_utils import get_logger
+from cognee.tasks.storage.edge_type_lifecycle import EDGE_TYPE_COLLECTION, edge_type_lifecycle
 
 logger = get_logger()
 
@@ -31,11 +32,24 @@ async def legacy_delete(data: Data, mode: str = "soft"):
     # migration has not run (ENABLE_AUTO_MIGRATIONS=false without
     # `cognee-cli upgrade`), this raises DocumentSubgraphNotFoundError on
     # purpose — un-migrated stores must not be mutated by guesswork.
-    deleted_node_ids = await delete_document_subgraph(data.id, mode)
-
-    # Delete from vector database
+    graph_engine = await get_graph_engine()
     vector_engine = await get_vector_engine_async()
 
+    # On Neo4j + PGVector the EdgeType lifecycle snapshots every edge incident to
+    # each node before delete_document_subgraph deletes it, and drops the orphaned
+    # EdgeType ids after the whole deletion; the id lists below then hold node ids
+    # only. Other backends keep collecting contains-edge text ids as before.
+    async with edge_type_lifecycle(graph_engine, vector_engine) as lifecycle:
+        deleted_node_ids = await delete_document_subgraph(
+            data.id, mode, graph_engine=graph_engine, vector_engine=vector_engine
+        )
+        await _delete_node_vectors(vector_engine, deleted_node_ids, lifecycle is not None)
+
+    return DeletedGraphElements(node_ids={str(node_id) for node_id in deleted_node_ids})
+
+
+async def _delete_node_vectors(vector_engine, deleted_node_ids, skip_edge_types: bool) -> None:
+    """Delete the deleted ids from every vector collection that exists."""
     # Determine vector collections dynamically
     subclasses = get_all_subclasses(DataPoint)
     vector_collections = []
@@ -58,17 +72,25 @@ async def legacy_delete(data: Data, mode: str = "soft"):
 
     # Delete records from each vector collection that exists
     for collection in vector_collections:
+        if skip_edge_types and collection == EDGE_TYPE_COLLECTION:
+            continue
         if await vector_engine.has_collection(collection):
             await vector_engine.delete_data_points(
                 collection, [str(node_id) for node_id in deleted_node_ids]
             )
 
-    return DeletedGraphElements(node_ids={str(node_id) for node_id in deleted_node_ids})
 
+async def delete_document_subgraph(
+    document_id: UUID, mode: str = "soft", *, graph_engine=None, vector_engine=None
+):
+    """Delete a document and all its related nodes in the correct order.
 
-async def delete_document_subgraph(document_id: UUID, mode: str = "soft"):
-    """Delete a document and all its related nodes in the correct order."""
-    graph_db = await get_graph_engine()
+    With a ``vector_engine`` on Neo4j + PGVector, the incident edges of every
+    deleted node feed the EdgeType lifecycle (the caller's block when it holds
+    one) and only node ids are returned. Without one the deletion stays
+    graph-only, as before.
+    """
+    graph_db = graph_engine or await get_graph_engine()
     subgraph = await graph_db.get_document_subgraph(str(document_id))
     if not subgraph:
         raise DocumentSubgraphNotFoundError(f"Document not found with id: {document_id}")
@@ -86,13 +108,12 @@ async def delete_document_subgraph(document_id: UUID, mode: str = "soft"):
     ]
 
     deleted_node_ids = []
-    for key, description in deletion_order:
-        nodes = subgraph[key]
-        if nodes:
-            for node in nodes:
-                node_id = node["id"]
 
-                if key == "chunks":
+    async def delete_nodes(key: str, node_ids: list[str]) -> None:
+        # Each group's incident edges are snapshotted right before it is deleted.
+        async with edge_type_lifecycle(graph_db, vector_engine, node_ids=node_ids) as lifecycle:
+            for node_id in node_ids:
+                if key == "chunks" and lifecycle is None:
                     chunk_connections = await graph_db.get_connections(node_id)
                     deleted_node_ids.extend(
                         [
@@ -105,18 +126,19 @@ async def delete_document_subgraph(document_id: UUID, mode: str = "soft"):
                 await graph_db.delete_node(node_id)
                 deleted_node_ids.append(node_id)
 
+    for key, description in deletion_order:
+        nodes = subgraph[key]
+        if nodes:
+            await delete_nodes(key, [node["id"] for node in nodes])
+
     # If hard mode, also delete degree-one nodes
     if mode == "hard":
         # Get and delete degree one entity nodes
         degree_one_entity_nodes = await graph_db.get_degree_one_nodes("Entity")
-        for node in degree_one_entity_nodes:
-            await graph_db.delete_node(node["id"])
-            deleted_node_ids.append(node["id"])
+        await delete_nodes("degree_one_entities", [node["id"] for node in degree_one_entity_nodes])
 
         # Get and delete degree one entity types
         degree_one_entity_types = await graph_db.get_degree_one_nodes("EntityType")
-        for node in degree_one_entity_types:
-            await graph_db.delete_node(node["id"])
-            deleted_node_ids.append(node["id"])
+        await delete_nodes("degree_one_types", [node["id"] for node in degree_one_entity_types])
 
     return deleted_node_ids

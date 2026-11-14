@@ -28,6 +28,7 @@ from cognee.tasks.storage.exceptions import (
 )
 
 from .chunk_ownership import collect_chunk_ownership
+from .edge_type_lifecycle import edge_type_lifecycle
 from .index_data_points import index_data_points
 from .index_graph_edges import index_graph_edges
 
@@ -352,55 +353,75 @@ async def add_data_points(
     else:
         nodes_to_embed = nodes
 
-    if use_hybrid:
-        # Hybrid backends embed inside the graph write, so the already embedded
-        # nodes are written without vectors and only the rest with them.
-        if len(nodes_to_embed) != len(nodes):
-            await graph_engine.add_nodes(
-                [node for node in nodes if str(node.id) in already_indexed]
-            )
-        if nodes_to_embed:
-            await graph_engine.add_nodes_with_vectors(nodes_to_embed)
-    elif graph_only:
-        await _write_nodes_grouped()
-    else:
-        await _write_nodes_grouped()
-        await index_data_points(
-            [node.model_copy(deep=True) for node in nodes_to_embed],
-            vector_engine=vector_engine,
-        )
-
-    if use_hybrid:
-        await graph_engine.add_edges_with_vectors(edges)
-    elif graph_only:
-        await _write_edges_grouped(edges)
-    else:
-        await _write_edges_grouped(edges)
-        if index_edges:
-            await index_graph_edges(edges, vector_engine=vector_engine)
-
-    if custom_edges:
-        # This must be handled separately from datapoint edges, created a task in linear to dig deeper but (COG-3488)
-        # Note: custom_edges is already normalized (with nodes) above, before the
-        # rollback-ledger upsert, so no second ensure_default_edge_properties here.
+    # EdgeType lifecycle (Neo4j + PGVector): an overwritten edge may carry a new
+    # retrieval text, so the texts these edges hold now are snapshotted before
+    # the first write and their vectors dropped afterwards unless a live edge
+    # still produces them. graph_only never initializes a vector engine, and
+    # hybrid / other backend pairs keep their previous path. A batch without
+    # edges neither indexes nor orphans an EdgeType text, so it takes no lock.
+    written_edge_identities = [
+        EdgeIdentity(str(edge[0]), str(edge[1]), str(edge[2]))
+        for edge in [*edges, *(custom_edges or [])]
+    ]
+    lifecycle_vector_engine = (
+        None if graph_only or use_hybrid or not written_edge_identities else vector_engine
+    )
+    async with edge_type_lifecycle(
+        graph_engine, lifecycle_vector_engine, edge_identities=written_edge_identities
+    ):
         if use_hybrid:
-            await graph_engine.add_edges_with_vectors(custom_edges)
+            # Hybrid backends embed inside the graph write, so the already embedded
+            # nodes are written without vectors and only the rest with them.
+            if len(nodes_to_embed) != len(nodes):
+                await graph_engine.add_nodes(
+                    [node for node in nodes if str(node.id) in already_indexed]
+                )
+            if nodes_to_embed:
+                await graph_engine.add_nodes_with_vectors(nodes_to_embed)
         elif graph_only:
-            await graph_engine.add_edges(
-                custom_edges,
-                source_ref_key=fold_source_ref_key,
-                pipeline_run_id=fold_run_arg,
-            )
+            await _write_nodes_grouped()
         else:
-            await graph_engine.add_edges(
-                custom_edges,
-                source_ref_key=fold_source_ref_key,
-                pipeline_run_id=fold_run_arg,
+            await _write_nodes_grouped()
+            await index_data_points(
+                [node.model_copy(deep=True) for node in nodes_to_embed],
+                vector_engine=vector_engine,
             )
-            if index_edges:
-                await index_graph_edges(custom_edges, vector_engine=vector_engine)
 
-        edges.extend(custom_edges)
+        if use_hybrid:
+            await graph_engine.add_edges_with_vectors(edges)
+        elif graph_only:
+            await _write_edges_grouped(edges)
+        else:
+            await _write_edges_grouped(edges)
+            if index_edges:
+                await index_graph_edges(
+                    edges, vector_engine=vector_engine, graph_engine=graph_engine
+                )
+
+        if custom_edges:
+            # This must be handled separately from datapoint edges, created a task in linear to dig deeper but (COG-3488)
+            # Note: custom_edges is already normalized (with nodes) above, before the
+            # rollback-ledger upsert, so no second ensure_default_edge_properties here.
+            if use_hybrid:
+                await graph_engine.add_edges_with_vectors(custom_edges)
+            elif graph_only:
+                await graph_engine.add_edges(
+                    custom_edges,
+                    source_ref_key=fold_source_ref_key,
+                    pipeline_run_id=fold_run_arg,
+                )
+            else:
+                await graph_engine.add_edges(
+                    custom_edges,
+                    source_ref_key=fold_source_ref_key,
+                    pipeline_run_id=fold_run_arg,
+                )
+                if index_edges:
+                    await index_graph_edges(
+                        custom_edges, vector_engine=vector_engine, graph_engine=graph_engine
+                    )
+
+            edges.extend(custom_edges)
 
     if stores_provenance and use_hybrid:
         # Hybrid backends write nodes/edges and their vectors in one call that
