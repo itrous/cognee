@@ -5,6 +5,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from cognee.infrastructure.databases.graph import get_graph_engine
+from cognee.infrastructure.databases.provenance import EdgeIdentity
 from cognee.infrastructure.databases.vector import get_vector_engine
 from cognee.infrastructure.llm import LLMGateway
 from cognee.modules.graph.utils.entity_scoring import (
@@ -13,6 +14,7 @@ from cognee.modules.graph.utils.entity_scoring import (
 )
 from cognee.shared.logging_utils import get_logger
 from cognee.tasks.storage import index_graph_edges
+from cognee.tasks.storage.edge_type_lifecycle import edge_type_lifecycle
 
 logger = get_logger("cross_connect_entities")
 
@@ -97,8 +99,14 @@ async def cross_connect_entities(
 
     if edges and not dry_run:
         edges = await _drop_existing_edges(graph_engine, edges)
-        await graph_engine.add_edges(edges)
-        await index_graph_edges(edges)
+        vector_engine = get_vector_engine()
+        async with edge_type_lifecycle(
+            graph_engine,
+            vector_engine,
+            edge_identities=[EdgeIdentity(str(s), str(t), str(rel)) for s, t, rel, _ in edges],
+        ):
+            await graph_engine.add_edges(edges)
+            await index_graph_edges(edges, vector_engine=vector_engine, graph_engine=graph_engine)
 
     logger.info(
         "Cross-connect proposed %d edge(s)%s",

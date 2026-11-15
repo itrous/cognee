@@ -1453,3 +1453,318 @@ async def test_persist_context_index_edges_unstamped_on_ledger_graph(monkeypatch
     kwargs = unified_engine.graph.add_edges.await_args.kwargs
     assert kwargs["source_ref_key"] is None
     assert kwargs["pipeline_run_id"] is None
+
+
+# --- EdgeType lifecycle at delete_context_index_nodes (E1) --------------------
+
+
+def _context_store():
+    pytest.importorskip("neo4j")
+    pytest.importorskip("asyncpg")
+    from cognee.infrastructure.databases.graph.neo4j_driver.adapter import Neo4jAdapter
+    from cognee.infrastructure.databases.vector.pgvector.PGVectorAdapter import PGVectorAdapter
+    from cognee.modules.graph.models.EdgeType import EdgeType
+    from cognee.modules.graph.utils.prepare_edges_for_storage import get_edge_retrieval_text
+
+    def text_of(key, props):
+        return get_edge_retrieval_text(props.get("edge_text"), key[2])
+
+    class Graph(Neo4jAdapter):
+        def __init__(self, edges):
+            self.edges = edges
+            self.deleted_nodes = []
+
+        async def get_incident_edge_retrieval_texts(self, node_ids):
+            ids = set(node_ids)
+            return {text_of(k, p) for k, p in self.edges.items() if ids & {k[0], k[1]}}
+
+        async def get_existing_edge_type_ids(self, candidate_ids):
+            live = {str(EdgeType.id_for(text_of(k, p))) for k, p in self.edges.items()}
+            return live & set(candidate_ids)
+
+        async def delete_nodes(self, node_ids):
+            ids = set(node_ids)
+            self.deleted_nodes.extend(node_ids)
+            self.edges = {k: p for k, p in self.edges.items() if not ids & {k[0], k[1]}}
+
+    class Vector(PGVectorAdapter):
+        def __init__(self, rows):
+            self.db_uri = "postgresql+asyncpg://test/db"
+            self.schema = ""
+            self.rows = rows
+
+        async def has_collection(self, name):
+            return name in self.rows
+
+        async def delete_data_points(self, name, ids):
+            for point_id in ids:
+                self.rows.get(name, {}).pop(str(point_id), None)
+
+    return Graph, Vector, EdgeType
+
+
+class _NoLock:
+    def __init__(self, vector_adapter):
+        pass
+
+    async def acquire(self):
+        pass
+
+    async def ensure_held(self):
+        pass
+
+    async def release(self):
+        pass
+
+
+def _bucket_root_corpus():
+    Graph, Vector, EdgeType = _context_store()
+    bucket, root, document, entity, other = (str(uuid4()) for _ in range(5))
+    graph = Graph(
+        {
+            (bucket, document, SUMMARIZED_IN): {"edge_text": "bucket of Acme report"},
+            (bucket, root, "summarized_in"): {"edge_text": "shared index text"},
+            (entity, other, "related_to"): {"edge_text": "Shared Index Text"},  # kept edge
+        }
+    )
+    ids = {
+        str(EdgeType.id_for(text)): text for text in ("bucket of Acme report", "shared index text")
+    }
+    vector = Vector(
+        {
+            "EdgeType_relationship_name": ids,
+            "GlobalContextSummary_text": {bucket: "b", root: "r"},
+        }
+    )
+    return graph, vector, bucket, root, EdgeType
+
+
+@pytest.mark.asyncio
+async def test_delete_context_index_nodes_cleans_incident_texts(monkeypatch):
+    lifecycle_module = import_module("cognee.tasks.storage.edge_type_lifecycle")
+    monkeypatch.setattr(lifecycle_module, "_AdvisoryLock", _NoLock)
+    graph, vector, bucket, root, EdgeType = _bucket_root_corpus()
+
+    await persist_module.delete_context_index_nodes(
+        SimpleNamespace(graph=graph, vector=vector), [bucket, root]
+    )
+
+    edge_types = vector.rows["EdgeType_relationship_name"]
+    assert graph.deleted_nodes == [bucket, root]
+    assert all(bucket not in key and root not in key for key in graph.edges)
+    assert str(EdgeType.id_for("bucket of Acme report")) not in edge_types  # unique: gone
+    assert str(EdgeType.id_for("shared index text")) in edge_types  # kept edge uses it
+    assert vector.rows["GlobalContextSummary_text"] == {}
+
+
+@pytest.mark.asyncio
+async def test_delete_context_index_nodes_control_without_lifecycle(monkeypatch):
+    """Positive control: with the lifecycle switched off in this entrypoint only,
+    the unique hit of the deleted bucket stays behind."""
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def disabled(*args, **kwargs):
+        yield None
+
+    monkeypatch.setattr(persist_module, "edge_type_lifecycle", disabled)
+    graph, vector, bucket, root, EdgeType = _bucket_root_corpus()
+
+    await persist_module.delete_context_index_nodes(
+        SimpleNamespace(graph=graph, vector=vector), [bucket, root]
+    )
+
+    assert (
+        str(EdgeType.id_for("bucket of Acme report")) in vector.rows["EdgeType_relationship_name"]
+    )
+
+
+# --- Neo4j connection retry inside the real global_context_index stage (N1/N2) --
+
+
+def _scripted_neo4j(plans, responder):
+    """A real Neo4jAdapter over a driver whose sessions follow fault plans."""
+    pytest.importorskip("neo4j")
+    from cognee.infrastructure.databases.graph.neo4j_driver.adapter import Neo4jAdapter
+
+    class Result:
+        def __init__(self, rows, faults):
+            self.rows, self.faults = rows, faults
+
+        async def data(self):
+            if "data" in self.faults:
+                raise self.faults["data"]
+            return list(self.rows)
+
+    class Session:
+        def __init__(self, driver, faults):
+            self.driver, self.faults = driver, faults
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc_info):
+            return False
+
+        async def run(self, query, parameters=None):
+            self.driver.queries.append(query)
+            if "run" in self.faults:
+                raise self.faults["run"]
+            return Result(responder(query), self.faults)
+
+    class Driver:
+        def __init__(self):
+            self.sessions = 0
+            self.queries = []
+            self.close = AsyncMock()
+
+        def session(self, database=None):
+            faults = plans[self.sessions] if self.sessions < len(plans) else {}
+            self.sessions += 1
+            return Session(self, faults)
+
+    driver = Driver()
+    return Neo4jAdapter("bolt://unused", graph_database_allow_anonymous=True, driver=driver), driver
+
+
+def _dataset_rows(document_id):
+    chunk, alice, acme = str(uuid4()), str(uuid4()), str(uuid4())
+
+    def responder(query):
+        if "RETURN n.id AS id, labels(n)" in query:
+            return [
+                {
+                    "id": chunk,
+                    "properties": {
+                        "id": chunk,
+                        "type": "DocumentChunk",
+                        "document_id": document_id,
+                        "document_name": "report.txt",
+                    },
+                },
+                {"id": alice, "properties": {"id": alice, "type": "Entity", "name": "Alice"}},
+                {"id": acme, "properties": {"id": acme, "type": "Entity", "name": "Acme"}},
+            ]
+        if "RETURN n.id AS source" in query:
+            return [
+                {"source": chunk, "target": alice, "type": "contains", "properties": {}},
+                {"source": chunk, "target": acme, "type": "contains", "properties": {}},
+                {
+                    "source": alice,
+                    "target": acme,
+                    "type": "works_at",
+                    "properties": {"edge_text": "Alice works at Acme"},
+                },
+            ]
+        return []
+
+    return responder
+
+
+async def _run_global_context_stage(monkeypatch, plans):
+    from neo4j.exceptions import ServiceUnavailable
+
+    from cognee.modules.improve import GraphCapabilities, ImproveConfig, ImproveRunInputs
+    from cognee.modules.improve.stage import execute_stage
+    from cognee.modules.improve.stages import GlobalContextIndexStage
+    from cognee.modules.pipelines.models.PipelineRunInfo import (
+        PipelineRunCompleted,
+        PipelineRunErrored,
+    )
+
+    deadlock_retry_module = import_module(
+        "cognee.infrastructure.databases.graph.neo4j_driver.deadlock_retry"
+    )
+    sleep = AsyncMock()
+    monkeypatch.setattr(deadlock_retry_module, "asyncio", SimpleNamespace(sleep=sleep))
+
+    user = SimpleNamespace(id=uuid4())
+    dataset = SimpleNamespace(id=uuid4(), name="docs", owner_id=user.id)
+    document_id = str(uuid4())
+    adapter, driver = _scripted_neo4j(plans, _dataset_rows(document_id))
+
+    monkeypatch.setattr(
+        import_module("cognee.modules.improve.watermarks"),
+        "has_dataset_changed_since_last_improve",
+        AsyncMock(return_value=True),
+    )
+    load_module_ = import_module("cognee.tasks.memify.global_context_index.load_dataset_content")
+    monkeypatch.setattr(load_module_, "get_graph_engine", AsyncMock(return_value=adapter))
+    monkeypatch.setattr(
+        load_module_, "get_dataset_data", AsyncMock(return_value=[SimpleNamespace(id=document_id)])
+    )
+    build_module = import_module("cognee.tasks.memify.global_context_index.build_document_index")
+    unified = SimpleNamespace(graph=adapter, vector=SimpleNamespace())
+    monkeypatch.setattr(build_module, "get_unified_engine", AsyncMock(return_value=unified))
+    monkeypatch.setattr(build_module, "sync_dataset_routes", AsyncMock())
+    stored = AsyncMock()
+    monkeypatch.setattr(persist_module, "add_data_points", stored)
+
+    async def run_task_pair(extraction_tasks, enrichment_tasks, dataset, data, user, **_):
+        """Runs the real task pair the way the memify runner hands it over."""
+        ctx = PipelineContext(user=user, dataset=SimpleNamespace(id=dataset))
+        info = {"pipeline_run_id": uuid4(), "dataset_id": dataset, "dataset_name": "docs"}
+        try:
+            value = data
+            for task in [*extraction_tasks, *enrichment_tasks]:
+                value = await task.executable(value, ctx=ctx, **task.default_params["kwargs"])
+        except Exception as error:  # noqa: BLE001 - the memify runner reports any task failure
+            return {dataset: PipelineRunErrored(**info, error_message=str(error))}
+        return {dataset: PipelineRunCompleted(**info, payload=value)}
+
+    monkeypatch.setattr(
+        import_module("cognee.memify_pipelines.global_context_index"),
+        "run_memify_tasks",
+        run_task_pair,
+    )
+    inputs = ImproveRunInputs(
+        user=user,
+        dataset_id=dataset.id,
+        dataset=dataset,
+        session_ids=(),
+        config=ImproveConfig(),
+        capabilities=GraphCapabilities.assume_supported(),
+        build_global_context_index=True,
+    )
+    result = await execute_stage(GlobalContextIndexStage(), inputs)
+    return result, driver, stored, sleep
+
+
+@pytest.mark.asyncio
+async def test_global_context_stage_recovers_connection_error(monkeypatch):
+    from neo4j.exceptions import ServiceUnavailable, SessionExpired
+
+    # Sessions: node read (dropped), node read, edge read, index edge write
+    # (dropped after run, before the rows were read), index edge write.
+    plans = [
+        {"run": ServiceUnavailable("connection reset")},
+        {},
+        {},
+        {"data": SessionExpired("connection reset")},
+        {},
+    ]
+
+    result, driver, stored, sleep = await _run_global_context_stage(monkeypatch, plans)
+
+    assert result.status == "completed", result.error
+    assert driver.sessions == 5
+    assert sleep.await_count == 2
+    driver.close.assert_not_awaited()
+    summaries = stored.await_args.args[0]
+    bucket = next(summary for summary in summaries if not summary.is_root)
+    # The full rows of the second attempt reached the index, not a partial read.
+    assert "Alice" in bucket.text and "Acme" in bucket.text
+
+
+@pytest.mark.asyncio
+async def test_global_context_stage_exhaustion_is_errored(monkeypatch):
+    from neo4j.exceptions import ServiceUnavailable
+
+    plans = [{"run": ServiceUnavailable(f"down {index}")} for index in range(11)]
+
+    result, driver, stored, _sleep = await _run_global_context_stage(monkeypatch, plans)
+
+    assert result.status == "errored"
+    assert "down 10" in (result.error or "")
+    assert driver.sessions == 11
+    stored.assert_not_awaited()

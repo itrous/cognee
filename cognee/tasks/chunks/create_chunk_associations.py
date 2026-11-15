@@ -12,12 +12,16 @@ from uuid import NAMESPACE_URL, uuid5
 from pydantic import BaseModel, Field
 
 from cognee.infrastructure.databases.graph import get_graph_engine
-from cognee.infrastructure.databases.provenance import graph_provenance_write_kwargs
+from cognee.infrastructure.databases.provenance import (
+    EdgeIdentity,
+    graph_provenance_write_kwargs,
+)
 from cognee.infrastructure.databases.vector import get_vector_engine_async
 from cognee.infrastructure.llm import LLMGateway
 from cognee.infrastructure.llm.prompts import read_query_prompt, render_prompt
 from cognee.shared.logging_utils import get_logger
 from cognee.tasks.storage import index_graph_edges
+from cognee.tasks.storage.edge_type_lifecycle import edge_type_lifecycle
 
 logger = get_logger("chunk_associations")
 
@@ -218,13 +222,20 @@ async def create_chunk_associations(
     if edges:
         try:
             graph_engine = await get_graph_engine()
-            provenance_kwargs = await graph_provenance_write_kwargs(
+            async with edge_type_lifecycle(
                 graph_engine,
-                ctx,
-                fallback_data_id=uuid5(NAMESPACE_URL, "cognee:chunk-associations"),
-            )
-            await graph_engine.add_edges(edges, **provenance_kwargs)
-            await index_graph_edges(edges)
+                vector_engine,
+                edge_identities=[EdgeIdentity(str(s), str(t), str(r)) for s, t, r, _ in edges],
+            ):
+                provenance_kwargs = await graph_provenance_write_kwargs(
+                    graph_engine,
+                    ctx,
+                    fallback_data_id=uuid5(NAMESPACE_URL, "cognee:chunk-associations"),
+                )
+                await graph_engine.add_edges(edges, **provenance_kwargs)
+                await index_graph_edges(
+                    edges, vector_engine=vector_engine, graph_engine=graph_engine
+                )
             logger.info(f"Successfully persisted {len(edges)} edges to graph database")
         except Exception as e:
             logger.error(f"Failed to persist edges to graph database: {e}")
