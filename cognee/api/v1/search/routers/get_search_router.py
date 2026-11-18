@@ -137,6 +137,27 @@ class SearchPayloadDTO(InDTO):
         ),
     )
 
+    # Range and finiteness are checked by chunk_filter_config (422), not here: a
+    # rejected body is echoed back, and a NaN in it cannot be encoded as JSON.
+    min_similarity: float | None = Field(
+        default=None,
+        strict=True,
+        description=(
+            "search_type=CHUNKS only: keep chunks whose distance score gives"
+            " 1 - clamp(score, 0, 2) >= min_similarity (score is the backend distance)."
+            " A finite number from 0 to 1; with it top_k counts the chunks that pass."
+        ),
+    )
+    exclude_superseded: bool = Field(
+        default=False,
+        strict=True,
+        description=(
+            "search_type=CHUNKS only: drop every chunk that supports a fact whose"
+            " effective conflict status in the searched dataset is superseded; top_k"
+            " counts the chunks that remain. Requires one dataset per searched store."
+        ),
+    )
+
 
 def get_search_router() -> APIRouter:
     router = APIRouter()
@@ -269,6 +290,11 @@ def get_search_router() -> APIRouter:
         - **max_iter** (Optional[int]): Max agentic iterations, must be >= 1 (AGENTIC_COMPLETION only)
         - **include_references** (bool): Attach source references to completion-type results (default: true)
         - **code_query** (Optional[dict]): Structured operation arguments for CODE search
+        - **min_similarity** (Optional[float]): CHUNKS only. Keep chunks with
+          1 - clamp(score, 0, 2) >= min_similarity; a finite number from 0 to 1
+        - **exclude_superseded** (bool): CHUNKS only. Drop chunks that support a fact
+          whose effective status in the searched dataset is superseded. With either
+          filter, top_k counts the chunks that pass
 
         ## Response
         Returns a list of search results containing relevant nodes from the graph.
@@ -332,6 +358,8 @@ def get_search_router() -> APIRouter:
                 max_iter=payload.max_iter,
                 include_references=payload.include_references,
                 code_query=payload.code_query,
+                min_similarity=payload.min_similarity,
+                exclude_superseded=payload.exclude_superseded,
             )
 
             return jsonable_encoder(results)

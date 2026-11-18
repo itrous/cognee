@@ -1,17 +1,34 @@
+import math
+from numbers import Real
 from typing import Any
+from uuid import UUID
 
 from cognee.infrastructure.databases.unified import get_unified_engine
 from cognee.infrastructure.databases.vector.exceptions.exceptions import CollectionNotFoundError
 from cognee.modules.retrieval.base_retriever import BaseRetriever
-from cognee.modules.retrieval.exceptions.exceptions import NoDataError
+from cognee.modules.retrieval.exceptions.exceptions import NoDataError, QueryValidationError
 from cognee.modules.retrieval.utils.conflict_context import (
     attach_chunk_conflicts,
     public_chunk_payload,
     render_chunk_context,
 )
+from cognee.modules.retrieval.utils.results import result_id
+from cognee.modules.retrieval.utils.superseded_chunks import get_superseded_chunk_ids
 from cognee.shared.logging_utils import get_logger
 
 logger = get_logger("ChunksRetriever")
+
+
+def is_distance(score) -> bool:
+    return not isinstance(score, bool) and isinstance(score, Real) and math.isfinite(score)
+
+
+def passes_min_similarity(score, min_similarity: float) -> bool:
+    """``1 - clamp(score, 0, 2) >= min_similarity``; a missing or non-finite distance fails.
+
+    ``score`` is the backend distance, not a similarity.
+    """
+    return is_distance(score) and 1 - min(max(score, 0), 2) >= min_similarity
 
 
 class ChunksRetriever(BaseRetriever):
@@ -36,6 +53,9 @@ class ChunksRetriever(BaseRetriever):
         top_k: int | None = 5,
         node_name: list[str] | None = None,
         node_name_filter_operator: str = "OR",
+        min_similarity: float | None = None,
+        exclude_superseded: bool = False,
+        dataset_id: UUID | None = None,
     ):
         """
         Initializes the chunk retriever.
@@ -50,10 +70,26 @@ class ChunksRetriever(BaseRetriever):
               node set filtering.
             - node_name_filter_operator (str): Logical operator used when applying
               multiple node_name filters, such as "OR" or "AND". Defaults to "OR".
+            - min_similarity (Optional[float]): Keep only chunks whose distance ``score``
+              gives ``1 - clamp(score, 0, 2) >= min_similarity``. None applies no threshold.
+            - exclude_superseded (bool): Drop every chunk that supports a fact whose
+              effective status in ``dataset_id`` is ``superseded``.
+            - dataset_id (Optional[UUID]): The dataset whose provenance and conflict marks
+              decide ``exclude_superseded``; required by it.
+
+        With either filter set, ``top_k`` counts the chunks that pass: the vector
+        search is widened until ``top_k`` pass or no candidate can.
         """
+        if exclude_superseded and dataset_id is None:
+            raise QueryValidationError(
+                message="exclude_superseded requires a search scoped to one dataset."
+            )
         self.top_k = top_k
         self.node_name = node_name
         self.node_name_filter_operator = node_name_filter_operator
+        self.min_similarity = min_similarity
+        self.exclude_superseded = exclude_superseded
+        self.dataset_id = dataset_id
 
     async def get_completion_from_context(
         self, query: str, retrieved_objects: Any, context: Any
@@ -129,14 +165,17 @@ class ChunksRetriever(BaseRetriever):
         vector_engine = unified.vector
 
         try:
-            found_chunks = await vector_engine.search(
-                "DocumentChunk_text",
-                query,
-                limit=self.top_k,
-                include_payload=True,
-                node_name=self.node_name,
-                node_name_filter_operator=self.node_name_filter_operator,
-            )
+            if self.min_similarity is None and not self.exclude_superseded:
+                found_chunks = await vector_engine.search(
+                    "DocumentChunk_text",
+                    query,
+                    limit=self.top_k,
+                    include_payload=True,
+                    node_name=self.node_name,
+                    node_name_filter_operator=self.node_name_filter_operator,
+                )
+            else:
+                found_chunks = await self._search_filtered(unified, query)
         except CollectionNotFoundError as error:
             logger.error("DocumentChunk_text collection not found in vector database")
             raise NoDataError("No data found in the system, please add data first.") from error
@@ -144,3 +183,60 @@ class ChunksRetriever(BaseRetriever):
         logger.info(f"Found {len(found_chunks)} chunks from vector search")
         await attach_chunk_conflicts(found_chunks, graph_engine=unified.graph)
         return found_chunks
+
+    def _passes(self, chunk) -> bool:
+        return self.min_similarity is None or passes_min_similarity(
+            getattr(chunk, "score", None), self.min_similarity
+        )
+
+    async def _search_filtered(self, unified, query: str) -> list:
+        """The nearest ``top_k`` chunks that pass the filters, in distance order.
+
+        Each round asks the vector store for twice as many candidates as the last,
+        under the same node filters, until ``top_k`` pass, the store has no more,
+        or the farthest candidate is already below the threshold (distance order
+        means every later one is too). ``top_k=None`` reads every chunk at once.
+        """
+        vector_engine = unified.vector
+        query_vector = (await vector_engine.embedding_engine.embed_text([query]))[0]
+        superseded: set[str] = set()
+        checked: set[str] = set()
+        limit = self.top_k
+        while True:
+            candidates = await vector_engine.search(
+                "DocumentChunk_text",
+                None,
+                query_vector=query_vector,
+                limit=limit,
+                include_payload=True,
+                node_name=self.node_name,
+                node_name_filter_operator=self.node_name_filter_operator,
+            )
+            seen: set[str] = set()
+            passing = []
+            for chunk in candidates:
+                chunk_id = result_id(chunk)
+                if chunk_id in seen:
+                    continue
+                seen.add(chunk_id)
+                if self._passes(chunk):
+                    passing.append((chunk_id, chunk))
+            if self.exclude_superseded:
+                unchecked = [chunk_id for chunk_id, _ in passing if chunk_id not in checked]
+                if unchecked:
+                    superseded |= await get_superseded_chunk_ids(
+                        unified.graph, self.dataset_id, unchecked
+                    )
+                    checked.update(unchecked)
+            kept = [chunk for chunk_id, chunk in passing if chunk_id not in superseded]
+            if limit is None:
+                return kept
+            farthest = getattr(candidates[-1], "score", None) if candidates else None
+            rest_below_threshold = (
+                self.min_similarity is not None
+                and is_distance(farthest)
+                and not passes_min_similarity(farthest, self.min_similarity)
+            )
+            if len(kept) >= self.top_k or len(candidates) < limit or rest_below_threshold:
+                return kept[: self.top_k]
+            limit *= 2

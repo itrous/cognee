@@ -169,6 +169,27 @@ class RecallPayloadDTO(InDTO):
         ),
     )
 
+    # Range and finiteness are checked by chunk_filter_config (422), not here: a
+    # rejected body is echoed back, and a NaN in it cannot be encoded as JSON.
+    min_similarity: float | None = Field(
+        default=None,
+        strict=True,
+        description=(
+            "search_type=CHUNKS only: keep chunks whose distance score gives"
+            " 1 - clamp(score, 0, 2) >= min_similarity (score is the backend distance)."
+            " A finite number from 0 to 1; with it top_k counts the chunks that pass."
+        ),
+    )
+    exclude_superseded: bool = Field(
+        default=False,
+        strict=True,
+        description=(
+            "search_type=CHUNKS only: drop every chunk that supports a fact whose"
+            " effective conflict status in the searched dataset is superseded; top_k"
+            " counts the chunks that remain. Requires one dataset per searched store."
+        ),
+    )
+
 
 def get_recall_router() -> APIRouter:
     router = APIRouter()
@@ -260,6 +281,8 @@ def get_recall_router() -> APIRouter:
         - **code_query** (Optional[dict]): "code" scope only — operation and arguments
           for the code-graph query (same format as /v1/search code_query); omit for
           the default "explore" with the query text as seed
+        - **min_similarity** (Optional[float]) / **exclude_superseded** (bool): with
+          search_type=CHUNKS pinned only; the same filters as /v1/search
         - **response_schema** (Optional[dict]): JSON Schema for structured
           completion output; validated results land in each result's
           ``structured`` field. 422 on schemas outside the supported subset.
@@ -318,6 +341,8 @@ def get_recall_router() -> APIRouter:
                 tool_connections=payload.tool_connections,
                 tools_trigger=payload.tools_trigger,
                 code_query=payload.code_query,
+                min_similarity=payload.min_similarity,
+                exclude_superseded=payload.exclude_superseded,
             )
 
         streaming = wants_event_stream(request.headers.get("accept"), payload.stream)

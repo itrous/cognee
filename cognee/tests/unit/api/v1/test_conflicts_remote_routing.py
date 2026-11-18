@@ -7,6 +7,7 @@ from uuid import uuid4
 import pytest
 
 from cognee.api.v1.serve.cloud_client import CloudClient
+from cognee.modules.conflicts.exceptions import ConflictAlreadyResolvedError
 from cognee.modules.conflicts.models import ConflictDetail
 
 
@@ -114,3 +115,27 @@ async def test_resolve_conflict_posts_the_choice_and_surfaces_server_errors(monk
     with pytest.raises(RuntimeError, match="422"):
         await client.resolve_conflict(conflict_id, dataset_id=dataset_id, selected_fact_id=fact_id)
     assert captured["json"] == {"datasetId": str(dataset_id), "selectedFactId": str(fact_id)}
+
+
+@pytest.mark.asyncio
+async def test_conditional_resolve_sends_the_flag_and_maps_the_refusal(monkeypatch):
+    conflict_id, dataset_id, fact_id = uuid4(), uuid4(), uuid4()
+    client, captured = _client(
+        monkeypatch, _FakeResponse(status=409, text='{"error":"already_resolved"}')
+    )
+    with pytest.raises(ConflictAlreadyResolvedError):
+        await client.resolve_conflict(
+            conflict_id, dataset_id=dataset_id, selected_fact_id=fact_id, only_if_unresolved=True
+        )
+    assert captured["json"] == {
+        "datasetId": str(dataset_id),
+        "selectedFactId": str(fact_id),
+        "onlyIfUnresolved": True,
+    }
+
+    # Any other 409 stays a plain server error.
+    client, _ = _client(monkeypatch, _FakeResponse(status=409, text='{"error":"busy"}'))
+    with pytest.raises(RuntimeError, match="409"):
+        await client.resolve_conflict(
+            conflict_id, dataset_id=dataset_id, selected_fact_id=fact_id, only_if_unresolved=True
+        )

@@ -128,10 +128,13 @@ def _accept_conflict(
     facts = [scope.facts[fact_id] for fact_id in statuses]
     text = " ".join(result.text.split())
     reversed_dates = _is_ordering_reversed_by_dates(facts, statuses)
-    if result.kind == "fixed" or reversed_dates:
+    unordered = not reversed_dates and _is_supersession_unsupported(facts, statuses)
+    if result.kind == "fixed" or reversed_dates or unordered:
         statuses = dict.fromkeys(statuses, "conflicting")
     if reversed_dates:
         text += " Supplied dates disagree with the proposed ordering."
+    if unordered:
+        text += " Supplied documents and dates do not order these values."
 
     conflict = FactConflict(
         dataset_id=scope.dataset_id,
@@ -245,6 +248,31 @@ def _is_ordering_reversed_by_dates(facts: list[dict], statuses: dict[str, str]) 
         for status in ("current", "superseded")
     }
     return latest["current"] != NO_DATE and latest["superseded"] > latest["current"]
+
+
+def _is_supersession_unsupported(facts: list[dict], statuses: dict[str, str]) -> bool:
+    """True when some superseded fact has no current fact dated after it in another document.
+
+    Only dates of different documents order two values. One document stating both,
+    equal or missing dates, or no current fact at all leave them side by side, however
+    the LLM ordered them.
+    """
+    current = [fact for fact in facts if statuses[fact["id"]] == "current"]
+    return any(
+        not any(_is_dated_after(later, fact) for later in current)
+        for fact in facts
+        if statuses[fact["id"]] == "superseded"
+    )
+
+
+def _is_dated_after(later: dict, earlier: dict) -> bool:
+    """Is ``later`` stated only by other documents, dated strictly after ``earlier``?"""
+    if {source["data_id"] for source in later["sources"]} & {
+        source["data_id"] for source in earlier["sources"]
+    }:
+        return False
+    earlier_date = parse_date(earlier.get("effective_date"))
+    return earlier_date != NO_DATE and parse_date(later.get("effective_date")) > earlier_date
 
 
 # --- drops -------------------------------------------------------------------

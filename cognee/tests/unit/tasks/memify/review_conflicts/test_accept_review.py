@@ -43,11 +43,12 @@ def test_status_rules(scope, case):
         for value in scope.facts.values():
             value["effective_date"] = None
             value["sources"][0]["effective_date"] = None
+        expected = "unresolved"
         if case == "undated":
             result.current = result.superseded = []
             result.conflicting = ["r1", "r2"]
-            expected = "unresolved"
         else:
+            # Time words alone no longer order values: only dates of different documents do.
             scope.facts["e1"]["properties"]["edge_text"] = "Alice was the former CEO."
     elif case == "fixed":
         result.kind = "fixed"
@@ -67,6 +68,8 @@ def test_status_rules(scope, case):
         assert set(accepted.fact_statuses.values()) == {"conflicting"}
     if case in {"reversed", "mixed"}:
         assert "dates disagree" in accepted.conflict.text
+    if case == "time_words":
+        assert "do not order these values" in accepted.conflict.text
     if case == "mixed":
         assert accepted.conflict.attribute == "ceos office"
 
@@ -202,3 +205,101 @@ def test_a_date_competes_only_with_another_date(scope, other, kept):
     assert [item.conflict.values for item in batch.accepted_conflicts] == (
         [sorted(["2014", other])] if kept else []
     )
+
+
+def _ordering(scope, superseded, current, conflicting=()):
+    """Accept one time_varying conflict ordering these facts as the LLM said."""
+    # A stored conflict's marks keep every fact in the section, grouped or not: one
+    # document's two facts form no comparison of their own.
+    existing_conflict(scope)
+    prompt = build_prompt(scope, list(scope.entities))
+    labels = {fact_id: label for label, fact_id in prompt.fact_labels.items()}
+    output = response()
+    result = output.conflicts[0]
+    result.superseded = [labels[fact_id] for fact_id in superseded]
+    result.current = [labels[fact_id] for fact_id in current]
+    result.conflicting = [labels[fact_id] for fact_id in conflicting]
+    return accept_review_response(output, scope, prompt).accepted_conflicts[0]
+
+
+def _set_source(scope, fact_id, *sources):
+    """Restate a fact's citing documents as (data_id, date) pairs; its date is their latest."""
+    scope.facts[fact_id]["sources"] = [
+        {
+            "chunk_id": f"chunk-{fact_id}-{data_id}",
+            "data_id": data_id,
+            "document": data_id,
+            "effective_date": date,
+        }
+        for data_id, date in sources
+    ]
+    dates = [date for _, date in sources if date]
+    scope.facts[fact_id]["effective_date"] = max(dates) if dates else None
+
+
+@pytest.mark.parametrize(
+    "old_sources, new_sources",
+    [
+        # S04: one document states both, under one date.
+        ([("doc-s04", "2026-11-05")], [("doc-s04", "2026-11-05")]),
+        # One document states both, even when another, later one also states the current fact.
+        ([("doc-a", "2026-01-01")], [("doc-a", "2026-01-01"), ("doc-b", "2026-03-01")]),
+        # Different documents, one date.
+        ([("doc-a", "2026-11-05")], [("doc-b", "2026-11-05")]),
+        # No dates, or a date on one side only.
+        ([("doc-a", None)], [("doc-b", None)]),
+        ([("doc-a", None)], [("doc-b", "2026-03-01")]),
+        ([("doc-a", "2026-01-01")], [("doc-b", None)]),
+    ],
+    ids=[
+        "same document",
+        "shared document",
+        "equal dates",
+        "undated",
+        "old undated",
+        "new undated",
+    ],
+)
+def test_supersession_without_an_order_of_documents_and_dates_is_conflicting(
+    scope, old_sources, new_sources
+):
+    _set_source(scope, "e1", *old_sources)
+    _set_source(scope, "e2", *new_sources)
+    accepted = _ordering(scope, superseded=["e1"], current=["e2"])
+    assert accepted.fact_statuses == {"e1": "conflicting", "e2": "conflicting"}
+    assert accepted.conflict.status == "unresolved"
+    assert accepted.conflict.text.endswith(
+        "Supplied documents and dates do not order these values."
+    )
+
+
+def test_supersession_needs_a_current_fact(scope):
+    """Superseded with nothing current names no direction."""
+    accepted = _ordering(scope, superseded=["e1"], current=[], conflicting=["e2"])
+    assert set(accepted.fact_statuses.values()) == {"conflicting"}
+
+
+@pytest.mark.parametrize(
+    "dates",
+    [
+        {"e1": "2020-05-01", "e2": "2026-01-10"},
+        # The superseded fact sits between two current ones: the later one orders it.
+        {"e1": "2026-02-01", "e2": "2026-01-01", "e3": "2026-03-01"},
+    ],
+    ids=["two documents", "one later current of two"],
+)
+def test_different_documents_with_ordered_dates_keep_superseded_and_current(scope, dates):
+    if "e3" in dates:
+        scope.facts["e3"] = fact("e3", "carol", None)
+        scope.entities["carol"] = scope.nodes["carol"] = {
+            "id": "carol",
+            "name": "Carol",
+            "types": ["Person"],
+        }
+    for fact_id, date in dates.items():
+        _set_source(scope, fact_id, (f"doc-{fact_id}", date))
+    current = sorted(set(dates) - {"e1"})
+    accepted = _ordering(scope, superseded=["e1"], current=current)
+    assert accepted.fact_statuses == {"e1": "superseded", **dict.fromkeys(current, "current")}
+    assert accepted.conflict.status == "resolved"
+    assert "order" not in accepted.conflict.text

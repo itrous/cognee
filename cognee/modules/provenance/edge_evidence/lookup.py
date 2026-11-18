@@ -182,6 +182,57 @@ async def get_edge_sources(dataset_id: UUID, edge_ids: Iterable[UUID]) -> list[E
     return list(records.values())
 
 
+@dataclass(frozen=True, slots=True)
+class ChunkEdgeSupport:
+    chunk_id: UUID
+    edge_id: UUID
+    source_node_id: UUID
+    destination_node_id: UUID
+    relationship_name: str
+
+
+async def get_chunk_edges(dataset_id: UUID, chunk_ids: Iterable[UUID]) -> list[ChunkEdgeSupport]:
+    """The reverse of ``get_edge_sources``: every active edge each chunk supports.
+
+    Active means what it means there: the row's run completed (or it has no run)
+    and its document is still in the dataset. Like ``get_edge_sources`` it has no
+    result limit and propagates storage errors, because a caller deciding what a
+    chunk asserts must not mistake a failed read for a chunk with no facts.
+    """
+    chunk_ids = sorted(set(chunk_ids))
+    if not chunk_ids:
+        return []
+    evidence = ProvenanceEdgeEvidence
+    rows: set[tuple] = set()
+    async with get_relational_engine().get_async_session() as session:
+        for start in range(0, len(chunk_ids), _EDGE_SOURCE_BATCH_SIZE):
+            statement = (
+                select(
+                    evidence.chunk_id,
+                    evidence.edge_id,
+                    evidence.source_node_id,
+                    evidence.destination_node_id,
+                    evidence.relationship_name,
+                )
+                .distinct()
+                .outerjoin(
+                    PipelineRun,
+                    and_(
+                        PipelineRun.pipeline_run_id == evidence.pipeline_run_id,
+                        PipelineRun.status == PipelineRunStatus.DATASET_PROCESSING_COMPLETED,
+                    ),
+                )
+                .join(Data, and_(Data.id == evidence.data_id, Data.dataset_id == dataset_id))
+                .where(
+                    evidence.dataset_id == dataset_id,
+                    evidence.chunk_id.in_(chunk_ids[start : start + _EDGE_SOURCE_BATCH_SIZE]),
+                    or_(evidence.pipeline_run_id.is_(None), PipelineRun.id.is_not(None)),
+                )
+            )
+            rows.update(tuple(row) for row in (await session.execute(statement)).all())
+    return [ChunkEdgeSupport(*row) for row in sorted(rows, key=lambda row: (row[0], row[1]))]
+
+
 async def get_touched_entity_ids(dataset_id: UUID, since: datetime) -> set[str]:
     """Return candidate Entity endpoints observed by a completed write since the stamp."""
     evidence = ProvenanceEdgeEvidence

@@ -38,6 +38,7 @@ from cognee.tasks.memify.review_conflicts.write_conflicts import (
     write_conflicts,
 )
 
+from .exceptions import ConflictAlreadyResolvedError
 from .models import ConflictDetail, ConflictFact
 
 
@@ -130,6 +131,7 @@ async def resolve_conflict(
     dataset_id: UUID,
     selected_fact_id: UUID,
     reason: str | None = None,
+    only_if_unresolved: bool = False,
     user: User | None = None,
 ) -> ConflictDetail:
     """Choose an existing competing fact; keep rejected facts as historical evidence.
@@ -138,6 +140,10 @@ async def resolve_conflict(
     listed new evidence, it also rejects that evidence. A new choice explicitly
     revises the prior decision. Automatic improve preserves the choice while its
     selected fact exists, and never rejects evidence the user did not see.
+
+    ``only_if_unresolved`` makes the choice conditional: a conflict that a user decided
+    or that is not ``unresolved`` raises ``ConflictAlreadyResolvedError`` and nothing is
+    written. The check and the write share one hold of the dataset lock.
     """
     from cognee.api.v1.serve.state import get_remote_client
 
@@ -148,6 +154,7 @@ async def resolve_conflict(
             dataset_id=dataset_id,
             selected_fact_id=selected_fact_id,
             reason=reason,
+            only_if_unresolved=only_if_unresolved,
         )
     user, dataset = await _authorized_dataset(dataset_id, user, "write")
     conflict_id, selected_fact_id = str(conflict_id), str(selected_fact_id)
@@ -174,6 +181,10 @@ async def resolve_conflict(
             )
             if stored is None:
                 raise EntityNotFoundError(message="Conflict not found in this dataset")
+            if only_if_unresolved and (
+                stored.get("resolution_source") == "user" or stored.get("status") != "unresolved"
+            ):
+                raise ConflictAlreadyResolvedError()
             ctx = PipelineContext(user=user, dataset=dataset)
             scope = await read_entity_facts(None, entity_ids=[stored["about_id"]], ctx=ctx)
             statuses = _conflict_facts(conflict_id, scope)

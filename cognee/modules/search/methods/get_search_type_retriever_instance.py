@@ -39,6 +39,7 @@ from cognee.modules.retrieval.natural_language_retriever import NaturalLanguageR
 from cognee.modules.retrieval.skills_retriever import SkillsRetriever
 from cognee.modules.retrieval.summaries_retriever import SummariesRetriever
 from cognee.modules.retrieval.temporal_hybrid_retriever import TemporalHybridRetriever
+from cognee.modules.search.chunk_filters import chunk_filter_config
 from cognee.modules.search.exceptions import SearchTypeDisabledError, UnsupportedSearchTypeError
 from cognee.modules.search.operations import select_search_type
 from cognee.modules.search.types import SearchType
@@ -107,6 +108,11 @@ async def get_search_type_retriever_instance(
     retriever_specific_config = kwargs.get("retriever_specific_config")
     if retriever_specific_config is None:
         retriever_specific_config = {}
+    chunk_filters = chunk_filter_config(
+        query_type,
+        retriever_specific_config.get("min_similarity"),
+        retriever_specific_config.get("exclude_superseded", False),
+    )
 
     # Extract common defaults with fallback values from kwargs
     top_k = kwargs.get("top_k", 15)
@@ -151,6 +157,10 @@ async def get_search_type_retriever_instance(
                 "top_k": top_k,
                 "node_name": node_name,
                 "node_name_filter_operator": node_name_filter_operator,
+                **chunk_filters,
+                # Explicit, not the dataset context var: that one is unset when backend
+                # access control is off.
+                "dataset_id": dataset.id if dataset is not None else None,
             },
         ),
         # No top_k: BROAD reads the whole dataset (SDK-324).
