@@ -371,7 +371,11 @@ async def test_sdk_calls_follow_serve_to_the_remote_instance(monkeypatch):
         conflict_id, dataset_id=dataset_id, selected_fact_id=fact_id, reason="Verified"
     )
     client.resolve_conflict.assert_awaited_once_with(
-        conflict_id, dataset_id=dataset_id, selected_fact_id=fact_id, reason="Verified"
+        conflict_id,
+        dataset_id=dataset_id,
+        selected_fact_id=fact_id,
+        reason="Verified",
+        only_if_unresolved=False,
     )
 
 

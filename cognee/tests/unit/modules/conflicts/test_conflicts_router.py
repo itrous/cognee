@@ -52,6 +52,7 @@ async def test_http_lists_and_resolves_with_authenticated_user_and_typed_body(mo
             dataset_id=dataset_id,
             selected_fact_id=fact_id,
             reason="Verified",
+            only_if_unresolved=False,
             user=user,
         )
         bad = await client.post(

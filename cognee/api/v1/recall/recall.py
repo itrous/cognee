@@ -45,6 +45,7 @@ from cognee.modules.retrieval.broad_store import BroadQueryError
 from cognee.modules.retrieval.code_retriever import CodeSeedNotFoundError
 from cognee.modules.retrieval.exceptions import SearchTypeNotSupported
 from cognee.modules.retrieval.exceptions.exceptions import NoDataError
+from cognee.modules.search.chunk_filters import chunk_filter_config
 from cognee.modules.search.exceptions import UnsupportedSearchTypeError
 from cognee.modules.search.models.SearchResultPayload import SearchResultPayload
 from cognee.modules.search.types import SearchResult, SearchType
@@ -460,6 +461,8 @@ async def recall(
     tool_connections: list[str] | None = None,
     tools_trigger: str = "always",
     code_query: dict | None = None,
+    min_similarity: float | None = None,
+    exclude_superseded: bool = False,
     user: object | None = None,
     llm_config: LLMConfig | None = None,
     embedding_config: EmbeddingConfig | None = None,
@@ -517,6 +520,10 @@ async def recall(
             tagged ``source="code"``. A seed the code graph cannot resolve, a
             dataset without a code graph, or flows on a graph without them
             contribute nothing rather than failing the recall.
+        min_similarity: Pinned ``query_type=SearchType.CHUNKS`` only; same
+            server-side distance threshold as ``search(min_similarity=...)``.
+        exclude_superseded: Pinned ``query_type=SearchType.CHUNKS`` only; same
+            filter as ``search(exclude_superseded=...)``.
 
     Returns:
         Search results. When searching session-only, returns a list of
@@ -541,6 +548,12 @@ async def recall(
             **(retriever_specific_config or {}),
             "response_model": response_model,
         }
+
+    # The CHUNKS filters ride the same channel; the router never picks CHUNKS, so a
+    # filter is valid only with that type pinned.
+    chunk_filters = chunk_filter_config(query_type, min_similarity, exclude_superseded)
+    if chunk_filters:
+        retriever_specific_config = {**(retriever_specific_config or {}), **chunk_filters}
 
     # Pass the User through rather than pre-resolving its id: send_telemetry
     # reads both id and tenant_id off it.
@@ -659,6 +672,7 @@ async def recall(
                 tool_connections=tool_connections,
                 tools_trigger=tools_trigger,
                 code_query=code_query,
+                **chunk_filters,
             )
             span.set_attribute(COGNEE_RECALL_SOURCE, "cloud")
             span.set_attribute(COGNEE_RESULT_COUNT, len(results) if results else 0)

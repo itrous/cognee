@@ -330,3 +330,85 @@ async def test_lookup_excludes_evidence_whose_document_was_deleted(monkeypatch):
 
     assert await lookup.get_edge_evidence_records([edge_id], dataset_id) == []
     await sql_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_chunk_edges_are_the_active_support_of_this_dataset(monkeypatch):
+    sql_engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    sessions = async_sessionmaker(sql_engine, expire_on_commit=False)
+    async with sql_engine.begin() as connection:
+        for table in (Data.__table__, PipelineRun.__table__, ProvenanceEdgeEvidence.__table__):
+            await connection.run_sync(lambda sync, table=table: table.create(sync))
+    monkeypatch.setattr(
+        lookup, "get_relational_engine", lambda: SimpleNamespace(get_async_session=sessions)
+    )
+    dataset_id, other_dataset_id = uuid4(), uuid4()
+    data_id, deleted_data_id, other_data_id = uuid4(), uuid4(), uuid4()
+    run_id, failed_run_id = uuid4(), uuid4()
+    chunk_id, unasked_chunk_id = uuid4(), uuid4()
+    kept_edge, runless_edge = uuid4(), uuid4()
+    source, target = uuid4(), uuid4()
+
+    def observation(edge_id, **overrides):
+        properties = {
+            "id": uuid4(),
+            "user_id": uuid4(),
+            "dataset_id": dataset_id,
+            "data_id": data_id,
+            "pipeline_run_id": run_id,
+            "chunk_id": chunk_id,
+            "chunk_index": 0,
+            "edge_id": edge_id,
+            "source_node_id": source,
+            "destination_node_id": target,
+            "relationship_name": "has_value",
+        }
+        return ProvenanceEdgeEvidence(**(properties | overrides))
+
+    async with sessions() as session:
+        session.add(Data(id=data_id, dataset_id=dataset_id, name="doc"))
+        session.add(Data(id=other_data_id, dataset_id=other_dataset_id, name="other"))
+        session.add(
+            PipelineRun(
+                pipeline_run_id=run_id, status=PipelineRunStatus.DATASET_PROCESSING_COMPLETED
+            )
+        )
+        session.add_all(
+            [
+                observation(kept_edge),
+                observation(kept_edge),  # a second observation of the same support
+                observation(runless_edge, pipeline_run_id=None),
+                observation(uuid4(), pipeline_run_id=failed_run_id),  # run never completed
+                observation(uuid4(), data_id=deleted_data_id),  # document deleted
+                observation(
+                    uuid4(), dataset_id=other_dataset_id, data_id=other_data_id
+                ),  # another dataset's evidence for the same chunk id
+                observation(uuid4(), chunk_id=unasked_chunk_id),
+            ]
+        )
+        await session.commit()
+
+    supports = await lookup.get_chunk_edges(dataset_id, [chunk_id])
+
+    assert sorted((s.edge_id for s in supports), key=str) == sorted(
+        [kept_edge, runless_edge], key=str
+    )
+    assert {(s.chunk_id, s.source_node_id, s.destination_node_id) for s in supports} == {
+        (chunk_id, source, target)
+    }
+    assert {s.relationship_name for s in supports} == {"has_value"}
+    assert await lookup.get_chunk_edges(dataset_id, []) == []
+    await sql_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_chunk_edges_propagate_storage_errors(monkeypatch):
+    sql_engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    sessions = async_sessionmaker(sql_engine, expire_on_commit=False)
+    monkeypatch.setattr(
+        lookup, "get_relational_engine", lambda: SimpleNamespace(get_async_session=sessions)
+    )
+
+    with pytest.raises(OperationalError):
+        await lookup.get_chunk_edges(uuid4(), [uuid4()])
+    await sql_engine.dispose()

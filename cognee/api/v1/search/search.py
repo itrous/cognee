@@ -28,6 +28,7 @@ from cognee.modules.observability import (
     record_query_results,
 )
 from cognee.modules.operations import record_operation
+from cognee.modules.search.chunk_filters import chunk_filter_config
 from cognee.modules.search.methods import search as search_function
 from cognee.modules.search.types import SearchResult, SearchType
 from cognee.modules.search.types.SearchType import resolve_deprecated_search_type
@@ -70,6 +71,8 @@ async def search(
     llm_config: LLMConfig | None = None,
     embedding_config: EmbeddingConfig | None = None,
     code_query: dict[str, Any] | None = None,
+    min_similarity: float | None = None,
+    exclude_superseded: bool = False,
 ) -> list[SearchResult]:
     """
     Search and query the knowledge graph for insights, information, and connections.
@@ -196,6 +199,11 @@ async def search(
         skills: Explicit skill names or Skill objects to load into the agentic retriever.
         tools: Optional whitelist of tool names available to the agentic retriever.
         max_iter: Maximum number of agentic tool-call iterations before forcing a final answer.
+        min_similarity: CHUNKS only. Keep chunks with ``1 - clamp(score, 0, 2) >= min_similarity``
+                    (``score`` is the backend distance); a finite number from 0 to 1.
+        exclude_superseded: CHUNKS only. Drop every chunk that supports a fact whose
+                    effective conflict status in the searched dataset is ``superseded``.
+                    With either filter, ``top_k`` counts chunks that pass.
 
     Returns:
         list: Search results in format determined by query_type:
@@ -273,6 +281,7 @@ async def search(
             message="code_query requires query_type=SearchType.CODE.",
             name="InvalidCodeSearchConfig",
         )
+    chunk_filters = chunk_filter_config(query_type, min_similarity, exclude_superseded)
     agentic_overrides = {
         "skills": skills,
         "tools": tools,
@@ -296,6 +305,7 @@ async def search(
             verbose=verbose,
             include_references=include_references,
             code_query=code_query,
+            **chunk_filters,
             **{key: value for key, value in agentic_overrides.items() if value is not None},
         )
 
@@ -395,6 +405,9 @@ async def search(
             if code_query is not None:
                 retriever_specific_config = dict(retriever_specific_config or {})
                 retriever_specific_config.update(code_query)
+
+            if chunk_filters:
+                retriever_specific_config = {**(retriever_specific_config or {}), **chunk_filters}
 
             filtered_search_results = await search_function(
                 query_text=query_text,

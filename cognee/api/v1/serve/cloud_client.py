@@ -8,6 +8,7 @@ from uuid import UUID
 
 import aiohttp
 
+from cognee.modules.conflicts.exceptions import ConflictAlreadyResolvedError
 from cognee.modules.conflicts.models import ConflictDetail
 from cognee.modules.ingestion.data_types.TextData import create_text_data
 from cognee.shared.logging_utils import get_logger
@@ -38,6 +39,15 @@ def _failed_update_result(body: str) -> dict | None:
     if isinstance(payload, dict) and payload.get("status") == "failed" and "data_id" in payload:
         return UpdateResult.model_validate(payload).model_dump()
     return None
+
+
+def _json_error(body: str) -> object:
+    """The ``error`` field of a JSON object body, or None."""
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        return None
+    return payload.get("error") if isinstance(payload, dict) else None
 
 
 class CloudClient:
@@ -316,6 +326,10 @@ class CloudClient:
             payload["tools_trigger"] = kwargs["tools_trigger"]
         if kwargs.get("code_query") is not None:
             payload["code_query"] = kwargs["code_query"]
+        if kwargs.get("min_similarity") is not None:
+            payload["min_similarity"] = kwargs["min_similarity"]
+        if kwargs.get("exclude_superseded"):
+            payload["exclude_superseded"] = True
 
         async with session.post(
             f"{self.service_url}/api/v1/recall",
@@ -702,6 +716,10 @@ class CloudClient:
             payload["includeReferences"] = kwargs["include_references"]
         if kwargs.get("code_query") is not None:
             payload["codeQuery"] = kwargs["code_query"]
+        if kwargs.get("min_similarity") is not None:
+            payload["minSimilarity"] = kwargs["min_similarity"]
+        if kwargs.get("exclude_superseded"):
+            payload["excludeSuperseded"] = True
 
         async with session.post(
             f"{self.service_url}/api/v1/search",
@@ -768,6 +786,7 @@ class CloudClient:
         dataset_id: UUID,
         selected_fact_id: UUID,
         reason: str | None = None,
+        only_if_unresolved: bool = False,
     ) -> ConflictDetail:
         """POST /api/v1/conflicts/{conflict_id}/resolve — accept one competing fact."""
         session = await self._get_session()
@@ -775,6 +794,8 @@ class CloudClient:
         payload: dict = {"datasetId": str(dataset_id), "selectedFactId": str(selected_fact_id)}
         if reason is not None:
             payload["reason"] = reason
+        if only_if_unresolved:
+            payload["onlyIfUnresolved"] = True
 
         async with session.post(
             f"{self.service_url}/api/v1/conflicts/{conflict_id}/resolve",
@@ -782,5 +803,7 @@ class CloudClient:
         ) as resp:
             if resp.status >= 400:
                 body = await resp.text()
+                if resp.status == 409 and _json_error(body) == "already_resolved":
+                    raise ConflictAlreadyResolvedError()
                 raise RuntimeError(f"Remote resolve_conflict failed ({resp.status}): {body}")
             return ConflictDetail.model_validate(await resp.json())
